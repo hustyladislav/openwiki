@@ -38,6 +38,23 @@ export function createOpenWikiIndexMiddleware(
   });
 }
 
+/** Creates child-safe validation middleware without root-only index writes. */
+export function createOpenWikiSubagentMiddleware(
+  backend: BackendProtocolV2,
+  outputMode: OpenWikiOutputMode,
+) {
+  return createMiddleware({
+    name: "OpenWikiSubagentMiddleware",
+    wrapToolCall: async (request, handler) =>
+      addFrontmatterWarning(
+        await handler(request),
+        backend,
+        outputMode,
+        request.toolCall.name,
+      ),
+  });
+}
+
 /** Synchronizes the index for every directory in the configured wiki. */
 export async function synchronizeWikiIndexes(
   backend: BackendProtocolV2,
@@ -170,8 +187,14 @@ function parseFrontmatter(
   content: string,
   filePath: string,
 ): { description?: string; title?: string } {
-  const block = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(content)?.[1];
-  if (!block) throw new Error(`${filePath} lacks YAML front matter.`);
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(content);
+  if (!match) {
+    if (/^---(?:\r?\n|$)/u.test(content)) {
+      throw new Error(`${filePath} contains unterminated YAML front matter.`);
+    }
+    return {};
+  }
+  const block = match[1];
 
   let fields: unknown;
   try {

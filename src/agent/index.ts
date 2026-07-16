@@ -9,7 +9,11 @@ import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatOpenRouter } from "@langchain/openrouter";
 import type { Event as ProtocolEvent } from "@langchain/protocol";
-import { createDeepAgent } from "deepagents";
+import {
+  createDeepAgent,
+  createFilesystemMiddleware,
+  GENERAL_PURPOSE_SUBAGENT,
+} from "deepagents";
 import { createOpenWikiConnectorTools } from "../connectors/tools.js";
 import {
   DEBUG_ENV_KEYS,
@@ -21,7 +25,10 @@ import { isFileNotFoundError } from "../fs-errors.js";
 import { SECRET_KEY_PATTERN_SOURCE } from "../diagnostics.js";
 import { openWikiLocalWikiDir, openWikiSkillsDir } from "../openwiki-home.js";
 import { OpenWikiLocalShellBackend } from "./docs-only-backend.js";
-import { createOpenWikiIndexMiddleware } from "./index-middleware.js";
+import {
+  createOpenWikiIndexMiddleware,
+  createOpenWikiSubagentMiddleware,
+} from "./index-middleware.js";
 import {
   CODEX_ORIGINATOR,
   CODEX_RESPONSES_BASE_URL,
@@ -89,6 +96,14 @@ import {
   shouldCheckUpdateNoop,
 } from "./utils.js";
 import { classifyError, recordRunSafe } from "../telemetry/index.js";
+
+const SUBAGENT_CONNECTOR_TOOL_NAMES = new Set([
+  "openwiki_call_mcp_tool",
+  "openwiki_list_connectors",
+  "openwiki_list_mcp_tools",
+  "openwiki_list_raw_items",
+  "openwiki_read_raw_item",
+]);
 
 export async function runOpenWikiAgent(
   command: OpenWikiCommand,
@@ -251,16 +266,34 @@ async function runOpenWikiAgentCore(
     openWikiSkillsDir,
   );
   let sourceUpdateReceipt: OpenWikiRunResult["sourceUpdateReceipt"];
+  const agentTools = readOnly
+    ? []
+    : createOpenWikiConnectorTools({
+        onSourceUpdateReceipt: (receipt) => {
+          sourceUpdateReceipt = receipt;
+        },
+        sourceUpdate: options.sourceUpdate,
+      });
+  const subagentTools = agentTools.filter((tool) =>
+    SUBAGENT_CONNECTOR_TOOL_NAMES.has(tool.name),
+  );
+  const subagentMiddleware =
+    command === "chat"
+      ? []
+      : [
+          ...(options.sourceUpdate
+            ? [
+                createFilesystemMiddleware({
+                  backend,
+                  tools: ["ls", "read_file", "glob", "grep"],
+                }),
+              ]
+            : []),
+          createOpenWikiSubagentMiddleware(wikiBackend, outputMode),
+        ];
   const agent = createDeepAgent({
     model,
-    tools: readOnly
-      ? []
-      : createOpenWikiConnectorTools({
-          onSourceUpdateReceipt: (receipt) => {
-            sourceUpdateReceipt = receipt;
-          },
-          sourceUpdate: options.sourceUpdate,
-        }),
+    tools: agentTools,
     checkpointer,
     backend,
     middleware:
@@ -268,6 +301,15 @@ async function runOpenWikiAgentCore(
         ? []
         : [createOpenWikiIndexMiddleware(wikiBackend, outputMode)],
     skills: ["/skills/"],
+    subagents: [
+      {
+        ...GENERAL_PURPOSE_SUBAGENT,
+        model,
+        tools: subagentTools,
+        skills: ["/skills/"],
+        middleware: subagentMiddleware,
+      },
+    ],
     systemPrompt: createSystemPrompt(command, outputMode),
   });
   emitDebug(options, "agent=created");

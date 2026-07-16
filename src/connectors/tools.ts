@@ -1,7 +1,4 @@
-import {
-  DynamicStructuredTool,
-  type StructuredToolInterface,
-} from "@langchain/core/tools";
+import { DynamicStructuredTool } from "@langchain/core/tools";
 import { constants as fsConstants } from "node:fs";
 import { type FileHandle, open, readdir, stat } from "node:fs/promises";
 import path from "node:path";
@@ -68,7 +65,7 @@ const RAW_ITEM_READ_CHUNK_MAX_BYTES = 64 * 1024;
 
 export function createOpenWikiConnectorTools(
   options: OpenWikiConnectorToolOptions = {},
-): StructuredToolInterface[] {
+): DynamicStructuredTool[] {
   const readRawItem = createRawItemReader();
   const sourceUpdateTracker = options.sourceUpdate
     ? createSourceUpdateReceiptTracker(options.sourceUpdate)
@@ -283,7 +280,7 @@ export function createOpenWikiConnectorTools(
 function createCompleteSourceUpdateTool(
   tracker: ReturnType<typeof createSourceUpdateReceiptTracker>,
   onReceipt: ((receipt: ConnectorSourceUpdateReceipt) => void) | undefined,
-): StructuredToolInterface {
+): DynamicStructuredTool {
   return new DynamicStructuredTool({
     name: "openwiki_complete_source_update",
     description:

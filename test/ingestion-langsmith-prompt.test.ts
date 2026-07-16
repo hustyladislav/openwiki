@@ -53,6 +53,10 @@ describe("deterministic ingestion prompt", () => {
     expect(message).toContain("openwiki_complete_source_update");
     expect(message).toContain("nextOffsetCharacters");
     expect(message).toContain("totalCharacters remains null until");
+    expect(message).toContain("surgical source update");
+    expect(message).toContain("Do not invoke the migrate-wiki-to-okf skill");
+    expect(message).toContain("Subagents are read-only");
+    expect(message).toContain("the root agent must make every wiki edit");
   });
 
   test("requires an explicit receipt while allowing a reviewed no-op", () => {

@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { OpenWikiLocalShellBackend } from "../src/agent/docs-only-backend.ts";
-import { synchronizeWikiIndexes } from "../src/agent/index-middleware.ts";
+import {
+  createOpenWikiIndexMiddleware,
+  createOpenWikiSubagentMiddleware,
+  synchronizeWikiIndexes,
+} from "../src/agent/index-middleware.ts";
 
 function document(title: string, description: string): string {
   return `---\ntype: Reference\ntitle: ${JSON.stringify(title)}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${title}\n`;
@@ -19,6 +23,21 @@ async function setup(outputMode: "local-wiki" | "repository" = "repository") {
   });
   return { backend, rootDir };
 }
+
+describe("OpenWiki index middleware roles", () => {
+  test("keeps deterministic index synchronization on the root agent only", async () => {
+    const { backend } = await setup("local-wiki");
+    const rootMiddleware = createOpenWikiIndexMiddleware(backend, "local-wiki");
+    const subagentMiddleware = createOpenWikiSubagentMiddleware(
+      backend,
+      "local-wiki",
+    );
+
+    expect(rootMiddleware.afterAgent).toBeTypeOf("function");
+    expect(subagentMiddleware.afterAgent).toBeUndefined();
+    expect(subagentMiddleware.wrapToolCall).toBeTypeOf("function");
+  });
+});
 
 describe("synchronizeWikiIndexes", () => {
   test("creates deterministic indexes for every directory", async () => {
@@ -133,6 +152,38 @@ describe("synchronizeWikiIndexes", () => {
       "- [Quoted: page](quoted.md) - A description: with a colon.",
     );
     expect(index).toContain("- [Folded](folded.md) - A folded description.");
+  });
+
+  test("indexes legacy Markdown by filename until it is migrated", async () => {
+    const { backend, rootDir } = await setup();
+    await backend.write("/openwiki/legacy-page.md", "# Legacy page\n");
+
+    await synchronizeWikiIndexes(backend, "repository");
+
+    await expect(
+      readFile(path.join(rootDir, "openwiki/index.md"), "utf8"),
+    ).resolves.toContain("- [legacy-page](legacy-page.md)");
+  });
+
+  test("rejects unterminated YAML front matter", async () => {
+    const { backend } = await setup();
+    await backend.write(
+      "/openwiki/page.md",
+      "---\ntype: Reference\ntitle: Page\n",
+    );
+
+    await expect(synchronizeWikiIndexes(backend, "repository")).rejects.toThrow(
+      "/openwiki/page.md contains unterminated YAML front matter.",
+    );
+  });
+
+  test("rejects empty YAML front matter", async () => {
+    const { backend } = await setup();
+    await backend.write("/openwiki/page.md", "---\n\n---\n# Page\n");
+
+    await expect(synchronizeWikiIndexes(backend, "repository")).rejects.toThrow(
+      "/openwiki/page.md YAML front matter must be a mapping.",
+    );
   });
 
   test("rejects malformed and duplicate YAML", async () => {
