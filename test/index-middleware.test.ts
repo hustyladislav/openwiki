@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -235,5 +235,82 @@ describe("synchronizeWikiIndexes", () => {
     await expect(
       readFile(path.join(rootDir, "empty/index.md"), "utf8"),
     ).resolves.toContain('title: "Empty"');
+  });
+
+  test("omits protected evidence without modifying it", async () => {
+    const { backend, rootDir } = await setup("local-wiki");
+    await mkdir(path.join(rootDir, "automation"));
+    await mkdir(path.join(rootDir, "projects"));
+    await mkdir(path.join(rootDir, "sources/langsmith/project"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(rootDir, "automation/index.md"),
+      "# Managed automation index\n",
+    );
+    await writeFile(
+      path.join(rootDir, "sources/langsmith/project/index.md"),
+      "# Curated source catalog\n",
+    );
+    await backend.write(
+      "/projects/memory.md",
+      document("Memory", "Current memory project."),
+    );
+
+    await synchronizeWikiIndexes(backend, "local-wiki", [
+      { directory: true, path: "automation" },
+      { directory: true, path: "sources/langsmith" },
+    ]);
+
+    await expect(
+      readFile(path.join(rootDir, "automation/index.md"), "utf8"),
+    ).resolves.toBe("# Managed automation index\n");
+    await expect(
+      readFile(
+        path.join(rootDir, "sources/langsmith/project/index.md"),
+        "utf8",
+      ),
+    ).resolves.toBe("# Curated source catalog\n");
+    await expect(
+      readFile(path.join(rootDir, "projects/index.md"), "utf8"),
+    ).resolves.toContain("[Memory](memory.md) - Current memory project.");
+    const rootIndex = await readFile(path.join(rootDir, "index.md"), "utf8");
+    expect(rootIndex).toContain("[projects](projects/)");
+    expect(rootIndex).not.toContain("automation");
+    expect(rootIndex).not.toContain("langsmith");
+  });
+
+  test("does not regenerate an exactly protected index file", async () => {
+    const { backend, rootDir } = await setup("local-wiki");
+    await mkdir(path.join(rootDir, "projects"));
+    await mkdir(path.join(rootDir, "topics"));
+    await writeFile(path.join(rootDir, "index.md"), "# Curated root index\n");
+    await writeFile(
+      path.join(rootDir, "projects/index.md"),
+      "# Curated projects index\n",
+    );
+    await backend.write(
+      "/projects/memory.md",
+      document("Memory", "Current memory project."),
+    );
+    await backend.write(
+      "/topics/tooling.md",
+      document("Tooling", "Current tooling notes."),
+    );
+
+    await synchronizeWikiIndexes(backend, "local-wiki", [
+      { directory: false, path: "index.md" },
+      { directory: false, path: "projects/index.md" },
+    ]);
+
+    await expect(
+      readFile(path.join(rootDir, "index.md"), "utf8"),
+    ).resolves.toBe("# Curated root index\n");
+    await expect(
+      readFile(path.join(rootDir, "projects/index.md"), "utf8"),
+    ).resolves.toBe("# Curated projects index\n");
+    await expect(
+      readFile(path.join(rootDir, "topics/index.md"), "utf8"),
+    ).resolves.toContain("[Tooling](tooling.md) - Current tooling notes.");
   });
 });

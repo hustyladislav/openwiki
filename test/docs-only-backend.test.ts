@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -138,5 +138,51 @@ describe("OpenWikiLocalShellBackend", () => {
       "blocked",
     );
     expect(write.error).toContain("ephemeral agent state");
+  });
+
+  test("keeps protected evidence readable while denying every mutation", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "openwiki-backend-"));
+    const protectedFile = path.join(rootDir, "automation/job.md");
+    await mkdir(path.dirname(protectedFile), { recursive: true });
+    await writeFile(protectedFile, "# Managed job\n");
+    const backend = new OpenWikiLocalShellBackend({
+      docsOnly: true,
+      outputMode: "local-wiki",
+      protectedPaths: [{ directory: true, path: "automation" }],
+      rootDir,
+      virtualMode: true,
+    });
+
+    const read = await backend.readRaw("/automation/job.md");
+    expect(read.error).toBeUndefined();
+    expect(read.data?.content).toBe("# Managed job\n");
+    const blockedWrite = await backend.write("/automation/new.md", "blocked");
+    expect(blockedWrite.error).toContain("protected paths");
+    const blockedEdit = await backend.edit(
+      "/automation/job.md",
+      "Managed",
+      "Changed",
+    );
+    expect(blockedEdit.error).toContain("protected paths");
+    const blockedDelete = await backend.delete("/automation/job.md");
+    expect(blockedDelete.error).toContain("protected paths");
+    const caseVariantWrite = await backend.write(
+      "/Automation/case-variant.md",
+      "blocked",
+    );
+    expect(caseVariantWrite.error).toContain("protected paths");
+    await expect(
+      backend.uploadFiles([
+        ["/automation/upload.md", new TextEncoder().encode("blocked")],
+      ]),
+    ).resolves.toEqual([
+      { error: "permission_denied", path: "/automation/upload.md" },
+    ]);
+    await expect(readFile(protectedFile, "utf8")).resolves.toBe(
+      "# Managed job\n",
+    );
+    await expect(
+      backend.execute("touch automation/escaped.md"),
+    ).resolves.toEqual(expect.objectContaining({ exitCode: 1 }));
   });
 });

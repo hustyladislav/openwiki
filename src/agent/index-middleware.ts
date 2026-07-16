@@ -3,6 +3,10 @@ import { createMiddleware } from "langchain";
 import path from "node:path";
 import { parse } from "yaml";
 import { addFrontmatterWarning } from "./frontmatter-validator.js";
+import {
+  isProtectedWikiPath,
+  type OpenWikiProtectedPath,
+} from "./protected-paths.js";
 import type { OpenWikiOutputMode } from "./types.js";
 
 const INDEX_FILE = "index.md";
@@ -22,6 +26,7 @@ interface Link {
 export function createOpenWikiIndexMiddleware(
   backend: BackendProtocolV2,
   outputMode: OpenWikiOutputMode,
+  protectedPaths: readonly OpenWikiProtectedPath[] = [],
 ) {
   return createMiddleware({
     name: "OpenWikiIndexMiddleware",
@@ -33,7 +38,7 @@ export function createOpenWikiIndexMiddleware(
         request.toolCall.name,
       ),
     afterAgent: async () => {
-      await synchronizeWikiIndexes(backend, outputMode);
+      await synchronizeWikiIndexes(backend, outputMode, protectedPaths);
     },
   });
 }
@@ -59,10 +64,23 @@ export function createOpenWikiSubagentMiddleware(
 export async function synchronizeWikiIndexes(
   backend: BackendProtocolV2,
   outputMode: OpenWikiOutputMode,
+  protectedPaths: readonly OpenWikiProtectedPath[] = [],
 ): Promise<void> {
   const root = outputMode === "local-wiki" ? "/" : "/openwiki";
-  for (const directory of await collectDirectories(backend, root, true)) {
-    await synchronizeDirectory(backend, directory, root);
+  for (const directory of await collectDirectories(
+    backend,
+    root,
+    outputMode,
+    protectedPaths,
+    true,
+  )) {
+    await synchronizeDirectory(
+      backend,
+      directory,
+      root,
+      outputMode,
+      protectedPaths,
+    );
   }
 }
 
@@ -70,6 +88,8 @@ export async function synchronizeWikiIndexes(
 async function collectDirectories(
   backend: BackendProtocolV2,
   directoryPath: string,
+  outputMode: OpenWikiOutputMode,
+  protectedPaths: readonly OpenWikiProtectedPath[],
   allowMissing = false,
 ): Promise<Directory[]> {
   const result = await backend.ls(directoryPath);
@@ -78,7 +98,9 @@ async function collectDirectories(
     throw new Error(`Unable to list ${directoryPath}: ${result.error}`);
   }
 
-  const entries = result.files ?? [];
+  const entries = (result.files ?? []).filter(
+    (entry) => !isProtectedWikiPath(entry.path, outputMode, protectedPaths),
+  );
   const children = entries.filter(
     (entry) => entry.is_dir && !entryName(entry).startsWith("."),
   );
@@ -87,6 +109,8 @@ async function collectDirectories(
       collectDirectories(
         backend,
         path.posix.join(directoryPath, entryName(entry)),
+        outputMode,
+        protectedPaths,
       ),
     ),
   );
@@ -98,7 +122,12 @@ async function synchronizeDirectory(
   backend: BackendProtocolV2,
   directory: Directory,
   root: string,
+  outputMode: OpenWikiOutputMode,
+  protectedPaths: readonly OpenWikiProtectedPath[],
 ): Promise<void> {
+  const indexPath = path.posix.join(directory.path, INDEX_FILE);
+  if (isProtectedWikiPath(indexPath, outputMode, protectedPaths)) return;
+
   const files: Link[] = [];
   const directories: Link[] = [];
 
@@ -129,7 +158,6 @@ async function synchronizeDirectory(
     });
   }
 
-  const indexPath = path.posix.join(directory.path, INDEX_FILE);
   const title =
     directory.path === root
       ? "OpenWiki"

@@ -41,6 +41,7 @@ import {
 import { createSystemPrompt, createUserPrompt } from "./prompt.js";
 import { syncBundledSkills } from "./skills.js";
 import { createOpenWikiCompositeBackend } from "./virtual-runtime-backends.js";
+import { loadOpenWikiProtectedPaths } from "./protected-paths.js";
 import {
   createVertexAuthFetch,
   resolveVertexSurface,
@@ -231,6 +232,7 @@ async function runOpenWikiAgentCore(
     options.disableShell === true ||
     process.env.OPENWIKI_DISABLE_SHELL === "1";
   const outputMode = options.outputMode ?? "local-wiki";
+  const protectedPaths = loadOpenWikiProtectedPaths(cwd, outputMode);
   const context = await createRunContext(command, cwd, outputMode);
   emitDebug(options, "context=created");
   const openWikiSnapshotBefore =
@@ -257,6 +259,7 @@ async function runOpenWikiAgentCore(
     shellDisabled,
     maxOutputBytes: 100_000,
     outputMode,
+    protectedPaths,
     rootDir: cwd,
     timeout: 120,
     virtualMode: true,
@@ -299,7 +302,7 @@ async function runOpenWikiAgentCore(
     middleware:
       command === "chat"
         ? []
-        : [createOpenWikiIndexMiddleware(backend, outputMode)],
+        : [createOpenWikiIndexMiddleware(backend, outputMode, protectedPaths)],
     skills: ["/skills/"],
     subagents: [
       {

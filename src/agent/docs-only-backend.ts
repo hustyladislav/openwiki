@@ -1,4 +1,5 @@
 import {
+  type DeleteResult,
   LocalShellBackend,
   type EditResult,
   type ExecuteResponse,
@@ -7,6 +8,10 @@ import {
   type WriteResult,
 } from "deepagents";
 import { OPEN_WIKI_DIR } from "../constants.js";
+import {
+  isProtectedWikiPath,
+  type OpenWikiProtectedPath,
+} from "./protected-paths.js";
 import type { OpenWikiOutputMode } from "./types.js";
 
 export const MUTATION_PATH_METADATA_KEY = "openwikiMutationPath";
@@ -14,6 +19,7 @@ export const MUTATION_PATH_METADATA_KEY = "openwikiMutationPath";
 type OpenWikiBackendOptions = LocalShellBackendOptions & {
   docsOnly?: boolean;
   outputMode?: OpenWikiOutputMode;
+  protectedPaths?: readonly OpenWikiProtectedPath[];
   readOnly?: boolean;
   shellDisabled?: boolean;
 };
@@ -21,6 +27,7 @@ type OpenWikiBackendOptions = LocalShellBackendOptions & {
 export class OpenWikiLocalShellBackend extends LocalShellBackend {
   private readonly docsOnly: boolean;
   private readonly outputMode: OpenWikiOutputMode;
+  private readonly protectedPaths: readonly OpenWikiProtectedPath[];
   private readonly readOnly: boolean;
   private readonly shellDisabled: boolean;
 
@@ -28,8 +35,12 @@ export class OpenWikiLocalShellBackend extends LocalShellBackend {
     super(options);
     this.docsOnly = options.docsOnly === true;
     this.outputMode = options.outputMode ?? "repository";
+    this.protectedPaths = options.protectedPaths ?? [];
     this.readOnly = options.readOnly === true;
-    this.shellDisabled = this.readOnly || options.shellDisabled === true;
+    this.shellDisabled =
+      this.readOnly ||
+      options.shellDisabled === true ||
+      this.protectedPaths.length > 0;
   }
 
   override async uploadFiles(
@@ -42,13 +53,12 @@ export class OpenWikiLocalShellBackend extends LocalShellBackend {
       }));
     }
 
-    if (!this.shellDisabled) {
-      return await super.uploadFiles(files);
-    }
-
     const responses: FileUploadResponse[] = [];
     for (const file of files) {
-      if (isTransientAgentPath(file[0])) {
+      if (
+        isProtectedWikiPath(file[0], this.outputMode, this.protectedPaths) ||
+        (this.shellDisabled && isTransientAgentPath(file[0]))
+      ) {
         responses.push({ error: "permission_denied", path: file[0] });
       } else {
         responses.push(...(await super.uploadFiles([file])));
@@ -98,9 +108,18 @@ export class OpenWikiLocalShellBackend extends LocalShellBackend {
     );
   }
 
+  override async delete(filePath: string): Promise<DeleteResult> {
+    const error = this.getDocsOnlyWriteError(filePath);
+    return error ? { error } : await super.delete(filePath);
+  }
+
   private getDocsOnlyWriteError(filePath: string): string | null {
     if (this.readOnly) {
       return "OpenWiki query mode is read-only; file writes are disabled.";
+    }
+
+    if (isProtectedWikiPath(filePath, this.outputMode, this.protectedPaths)) {
+      return `OpenWiki protected paths are read-only evidence; refused mutation: ${filePath}`;
     }
 
     if (this.shellDisabled && isTransientAgentPath(filePath)) {
