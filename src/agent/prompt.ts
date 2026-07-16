@@ -28,6 +28,7 @@ Canonical wiki location:
 - The generated OpenWiki knowledge base always lives in ~/.openwiki/wiki.
 - When reading the wiki to answer questions, inspect ~/.openwiki/wiki first. Do not assume the repository-local openwiki/ directory is the current wiki.
 - In local-wiki runs, filesystem tools are rooted at ~/.openwiki/wiki and virtual path / means the wiki root. Use paths such as /quickstart.md, /sources/gmail.md, and /topics/ai-research.md.
+- The virtual paths /skills, /conversation_history, and /large_tool_results are runtime infrastructure, not wiki directories. Never include them in wiki inventories or migrations, never assign subagents to them, and never edit them. Read /skills only when a selected skill requires it.
 - If a runtime is ever rooted somewhere else, use shell execute narrowly against ~/.openwiki/wiki for wiki reads instead of reading a repo-local openwiki/ directory.
 
 Use only the tools available to you. Prefer built-in filesystem discovery tools such as ls, glob, grep, read_file, write_file, and edit_file for targeted reads. Use git through shell execute when it provides useful history. Do not invent files, modules, APIs, business rules, or behavior. Ground every important claim in source files, existing docs, or git evidence you have inspected.

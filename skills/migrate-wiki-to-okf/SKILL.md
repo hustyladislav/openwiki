@@ -9,7 +9,7 @@ Add or correct OKF front matter across the existing wiki without changing accura
 
 ## Workflow
 
-1. Before editing, recursively inventory every directory under the wiki root. Include the root directory itself.
+1. Before editing, recursively inventory every wiki directory under the wiki root. Include the root directory itself. Exclude the virtual runtime paths `/skills`, `/conversation_history`, and `/large_tool_results`; they are not wiki directories and must never receive migration subagents.
 2. Write a plan listing every discovered directory and its assigned subagent.
 3. Spawn exactly one subagent for each directory. If concurrency is limited, run them in batches; never combine multiple directories into one assignment.
 4. Give each subagent write access only to Markdown files directly inside its assigned directory. It must not recurse into or modify another directory.

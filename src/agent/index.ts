@@ -9,12 +9,7 @@ import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatOpenRouter } from "@langchain/openrouter";
 import type { Event as ProtocolEvent } from "@langchain/protocol";
-import {
-  CompositeBackend,
-  createDeepAgent,
-  FilesystemBackend,
-  StateBackend,
-} from "deepagents";
+import { createDeepAgent } from "deepagents";
 import { createOpenWikiConnectorTools } from "../connectors/tools.js";
 import {
   DEBUG_ENV_KEYS,
@@ -38,6 +33,7 @@ import {
 } from "./openai-chatgpt-oauth.js";
 import { createSystemPrompt, createUserPrompt } from "./prompt.js";
 import { syncBundledSkills } from "./skills.js";
+import { createOpenWikiCompositeBackend } from "./virtual-runtime-backends.js";
 import {
   createVertexAuthFetch,
   resolveVertexSurface,
@@ -250,14 +246,10 @@ async function runOpenWikiAgentCore(
     timeout: 120,
     virtualMode: true,
   });
-  const backend = new CompositeBackend(wikiBackend, {
-    "/conversation_history/": new StateBackend(),
-    "/large_tool_results/": new StateBackend(),
-    "/skills/": new FilesystemBackend({
-      rootDir: openWikiSkillsDir,
-      virtualMode: true,
-    }),
-  });
+  const backend = createOpenWikiCompositeBackend(
+    wikiBackend,
+    openWikiSkillsDir,
+  );
   let sourceUpdateReceipt: OpenWikiRunResult["sourceUpdateReceipt"];
   const agent = createDeepAgent({
     model,
@@ -276,9 +268,6 @@ async function runOpenWikiAgentCore(
         ? []
         : [createOpenWikiIndexMiddleware(wikiBackend, outputMode)],
     skills: ["/skills/"],
-    permissions: [
-      { operations: ["write"], paths: ["/skills/**"], mode: "deny" },
-    ],
     systemPrompt: createSystemPrompt(command, outputMode),
   });
   emitDebug(options, "agent=created");
