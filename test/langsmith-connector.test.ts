@@ -9,6 +9,11 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import type {
+  ConnectorAcknowledgeResult,
+  ConnectorIngestResult,
+  ConnectorRuntime,
+} from "../src/connectors/types.ts";
 import type { LangSmithApi } from "../src/connectors/sources/langsmith/api.ts";
 import type {
   LangSmithProjectSelector,
@@ -107,11 +112,12 @@ describe("LangSmith connector", () => {
     const statePath = getStatePath(home);
     const stagedState = await readJson<ConnectorStateFile>(statePath);
     expect(stagedState.latestIds).toBeUndefined();
+    expect(stagedState.langsmith?.lastAcknowledgedTransactions).toBeUndefined();
     expect(
       Object.values(stagedState.langsmith?.pendingBatches ?? {}),
     ).toHaveLength(1);
 
-    await connector.acknowledge?.(result);
+    await acknowledgeConnector(connector, result);
     const committedState = await readJson<ConnectorStateFile>(statePath);
     expect(Object.values(committedState.latestIds ?? {})).toContain(
       fixedNow.toISOString(),
@@ -119,6 +125,54 @@ describe("LangSmith connector", () => {
     expect(
       Object.values(committedState.langsmith?.pendingBatches ?? {}),
     ).toHaveLength(0);
+    const [acknowledgedTransaction] = Object.values(
+      committedState.langsmith?.lastAcknowledgedTransactions ?? {},
+    );
+    expect(acknowledgedTransaction).toMatchObject({
+      acquisition: {
+        pendingRootIdsCarriedMissing: 0,
+        pendingRootIdsRequested: 0,
+        pendingRootRunsRefreshed: 0,
+        uniqueRootRunsEvaluated: 251,
+        windowRootRunsFetched: 251,
+      },
+      checkpoint: {
+        advanced: true,
+        successfulThroughAfter: fixedNow.toISOString(),
+        successfulThroughBefore: null,
+      },
+      connectorId: "langsmith",
+      connectorStatus: "success",
+      coverage: {
+        completeWindow: true,
+        changedLogicalTurns: 251,
+        changedTerminalRootRuns: 251,
+        changedThreads: 1,
+        logicalTurnsEvaluated: 251,
+        terminalRootRunsEligible: 251,
+        threadsEvaluated: 1,
+      },
+      endpoint: "https://eu.api.smith.langchain.com",
+      fetchedAt: fixedNow.toISOString(),
+      instanceId: "langsmith-1",
+      project: { id: "project-id", name: "agent-project" },
+      query: {
+        since: "2026-07-15T12:00:00.000Z",
+        until: fixedNow.toISOString(),
+      },
+      rawEvidenceFileCount: 2,
+      replayed: false,
+      runId: result.runId,
+      schemaVersion: 1,
+      scope: {
+        excludeTags: ["openwiki"],
+        includeCwdPrefixes: [],
+        kind: "root-runs",
+      },
+      synthesisOutcome: "updated",
+      warnings: [],
+    });
+    expect(JSON.stringify(acknowledgedTransaction)).not.toContain(home);
     expect((await stat(result.rawFiles[0])).mode & 0o777).toBe(0o600);
     expect((await stat(statePath)).mode & 0o777).toBe(0o600);
   });
@@ -152,6 +206,26 @@ describe("LangSmith connector", () => {
     );
   });
 
+  test("does not acknowledge source evidence without a synthesis outcome", async () => {
+    const home = await createTempHome();
+    const api = createFakeApi({
+      queryRootRuns: () =>
+        Promise.resolve({ runs: [createRun(1)], truncated: false }),
+    });
+    const { createLangSmithConnector } = await loadConnector(home);
+    const connector = createLangSmithConnector({ createApi: () => api });
+    const result = await connector.ingest(createOptions());
+
+    await expect(connector.acknowledge?.(result)).rejects.toThrow(
+      "require a valid synthesis outcome",
+    );
+    const state = await readJson<ConnectorStateFile>(getStatePath(home));
+    expect(state.latestIds).toBeUndefined();
+    expect(Object.values(state.langsmith?.pendingBatches ?? {})).toHaveLength(
+      1,
+    );
+  });
+
   test("replays an unacknowledged batch without refetching", async () => {
     const home = await createTempHome();
     let queryCount = 0;
@@ -172,6 +246,16 @@ describe("LangSmith connector", () => {
     expect(replay).toMatchObject({
       checkpointToken: first.checkpointToken,
       rawFiles: first.rawFiles,
+      replayed: true,
+      runId: first.runId,
+    });
+    await acknowledgeConnector(connector, replay);
+    const state = await readJson<ConnectorStateFile>(getStatePath(home));
+    const [acknowledgedTransaction] = Object.values(
+      state.langsmith?.lastAcknowledgedTransactions ?? {},
+    );
+    expect(typeof acknowledgedTransaction?.fetchedAt).toBe("string");
+    expect(acknowledgedTransaction).toMatchObject({
       replayed: true,
       runId: first.runId,
     });
@@ -255,6 +339,7 @@ describe("LangSmith connector", () => {
       throw new Error("Expected a staged LangSmith batch.");
     }
     delete stagedBatch.selectionKey;
+    delete stagedBatch.transaction;
     await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
     delete process.env[API_KEY_ENV];
 
@@ -266,6 +351,57 @@ describe("LangSmith connector", () => {
       replayed: true,
       runId: first.runId,
     });
+    await acknowledgeConnector(connector, replay);
+    const acknowledgedState = await readJson<ConnectorStateFile>(statePath);
+    expect(
+      Object.values(acknowledgedState.langsmith?.pendingBatches ?? {}),
+    ).toHaveLength(0);
+    const [acknowledgedTransaction] = Object.values(
+      acknowledgedState.langsmith?.lastAcknowledgedTransactions ?? {},
+    );
+    if (!acknowledgedTransaction) {
+      throw new Error("Expected an acknowledged LangSmith transaction.");
+    }
+    if (acknowledgedTransaction.schemaVersion !== 0) {
+      throw new Error("Expected legacy LangSmith transaction provenance.");
+    }
+    const expectedSuccessfulThrough = first.queryWindow?.until;
+    if (!expectedSuccessfulThrough) {
+      throw new Error("Expected a LangSmith query window.");
+    }
+    expect(acknowledgedTransaction).toMatchObject({
+      acknowledgedAt: acknowledgedTransaction.acknowledgedAt,
+      checkpoint: {
+        advanced: true,
+        successfulThroughAfter: expectedSuccessfulThrough,
+        successfulThroughBefore: null,
+      },
+      connectorId: "langsmith",
+      connectorStatus: "success",
+      query: first.queryWindow,
+      rawEvidenceFileCount: first.rawFiles.length,
+      reason: "staged-before-transaction-provenance",
+      replayed: true,
+      runId: first.runId,
+      schemaVersion: 0,
+    });
+    const acknowledgedAt =
+      "acknowledgedAt" in acknowledgedTransaction
+        ? acknowledgedTransaction.acknowledgedAt
+        : "invalid";
+    expect(new Date(acknowledgedAt).toISOString()).toBe(acknowledgedAt);
+    expect(acknowledgedTransaction).not.toHaveProperty("coverage");
+    expect(acknowledgedTransaction).not.toHaveProperty("fetchedAt");
+    expect(acknowledgedTransaction).not.toHaveProperty("instanceId");
+    expect(acknowledgedTransaction).not.toHaveProperty("project");
+    expect(acknowledgedTransaction).not.toHaveProperty("scope");
+    expect(Object.values(acknowledgedState.latestIds ?? {})).toContain(
+      first.queryWindow?.until,
+    );
+    expect(Object.values(acknowledgedState.pendingIds ?? {})).toEqual([[]]);
+    expect(
+      Object.values(acknowledgedState.langsmith?.seenHashes ?? {}),
+    ).toHaveLength(1);
   });
 
   test("preserves staged batches from concurrent connector instances", async () => {
@@ -278,13 +414,26 @@ describe("LangSmith connector", () => {
     const connector = createLangSmithConnector({ createApi: () => api });
     const options = createOptions();
 
-    await Promise.all([
+    const results = await Promise.all([
       connector.ingest({ ...options, instanceId: "langsmith-one" }),
       connector.ingest({ ...options, instanceId: "langsmith-two" }),
     ]);
 
-    const state = await readJson<ConnectorStateFile>(getStatePath(home));
-    expect(Object.keys(state.langsmith?.pendingBatches ?? {})).toHaveLength(2);
+    const stagedState = await readJson<ConnectorStateFile>(getStatePath(home));
+    expect(
+      Object.keys(stagedState.langsmith?.pendingBatches ?? {}),
+    ).toHaveLength(2);
+    for (const result of results) {
+      await acknowledgeConnector(connector, result);
+    }
+    const acknowledgedState = await readJson<ConnectorStateFile>(
+      getStatePath(home),
+    );
+    expect(
+      Object.keys(
+        acknowledgedState.langsmith?.lastAcknowledgedTransactions ?? {},
+      ),
+    ).toHaveLength(2);
   });
 
   test("does not checkpoint an explicitly limited pull", async () => {
@@ -299,9 +448,23 @@ describe("LangSmith connector", () => {
 
     expect(result.status).toBe("success");
     expect(result.warnings.join(" ")).toContain("cursor was not advanced");
-    await connector.acknowledge?.(result);
+    await acknowledgeConnector(connector, result, "no_changes");
     const state = await readJson<ConnectorStateFile>(getStatePath(home));
     expect(state.latestIds).toBeUndefined();
+    expect(
+      Object.values(state.langsmith?.lastAcknowledgedTransactions ?? {})[0],
+    ).toMatchObject({
+      acquisition: { windowRootRunsFetched: 1 },
+      checkpoint: {
+        advanced: false,
+        successfulThroughAfter: null,
+        successfulThroughBefore: null,
+      },
+      connectorStatus: "success",
+      coverage: { completeWindow: false },
+      rawEvidenceFileCount: 2,
+      synthesisOutcome: "no_changes",
+    });
   });
 
   test("rejects fractional explicit limits", async () => {
@@ -321,6 +484,52 @@ describe("LangSmith connector", () => {
     expect(result.status).toBe("error");
     expect(result.message).toContain("positive number");
     expect(queried).toBe(false);
+  });
+
+  test("records an incomplete no-change transaction without advancing the cursor", async () => {
+    const home = await createTempHome();
+    let isTruncated = false;
+    const api = createFakeApi({
+      queryRootRuns: () =>
+        Promise.resolve({ runs: [createRun(1)], truncated: isTruncated }),
+    });
+    const { createLangSmithConnector } = await loadConnector(home);
+    const connector = createLangSmithConnector({ createApi: () => api });
+    const options = createOptions();
+
+    const first = await connector.ingest(options);
+    await acknowledgeConnector(connector, first);
+    const beforeState = await readJson<ConnectorStateFile>(getStatePath(home));
+    const [successfulThroughBefore] = Object.values(
+      beforeState.latestIds ?? {},
+    );
+    isTruncated = true;
+
+    const truncated = await connector.ingest({ ...options, limit: 1 });
+    expect(truncated).toMatchObject({ rawFiles: [], status: "skipped" });
+    await acknowledgeConnector(connector, truncated);
+
+    const state = await readJson<ConnectorStateFile>(getStatePath(home));
+    expect(Object.values(state.latestIds ?? {})).toEqual([
+      successfulThroughBefore,
+    ]);
+    expect(
+      Object.values(state.langsmith?.lastAcknowledgedTransactions ?? {})[0],
+    ).toMatchObject({
+      checkpoint: {
+        advanced: false,
+        successfulThroughAfter: successfulThroughBefore,
+        successfulThroughBefore,
+      },
+      connectorStatus: "skipped",
+      coverage: {
+        changedLogicalTurns: 0,
+        completeWindow: false,
+        logicalTurnsEvaluated: 1,
+      },
+      rawEvidenceFileCount: 0,
+      synthesisOutcome: "not_required",
+    });
   });
 
   test("keeps missing pending roots until positively observed terminal", async () => {
@@ -349,15 +558,29 @@ describe("LangSmith connector", () => {
 
     const first = await connector.ingest(options);
     expect(first.status).toBe("skipped");
-    await connector.acknowledge?.(first);
+    await acknowledgeConnector(connector, first);
 
     const missingRefresh = await connector.ingest(options);
     expect(missingRefresh.status).toBe("skipped");
-    await connector.acknowledge?.(missingRefresh);
+    await acknowledgeConnector(connector, missingRefresh);
     const missingState = await readJson<ConnectorStateFile>(getStatePath(home));
     expect(Object.values(missingState.pendingIds ?? {})).toEqual([
       [pending.id],
     ]);
+    expect(
+      Object.values(
+        missingState.langsmith?.lastAcknowledgedTransactions ?? {},
+      )[0],
+    ).toMatchObject({
+      acquisition: {
+        pendingRootIdsCarriedMissing: 1,
+        pendingRootIdsRequested: 1,
+        pendingRootRunsRefreshed: 0,
+        uniqueRootRunsEvaluated: 0,
+        windowRootRunsFetched: 0,
+      },
+      coverage: { pendingRootIdsAfter: 1 },
+    });
 
     const terminal = await connector.ingest(options);
     expect(terminal.status).toBe("success");
@@ -369,9 +592,23 @@ describe("LangSmith connector", () => {
       pendingRoots: 0,
       rootRunsIncluded: 1,
     });
-    await connector.acknowledge?.(terminal);
+    await acknowledgeConnector(connector, terminal);
     const finalState = await readJson<ConnectorStateFile>(getStatePath(home));
     expect(Object.values(finalState.pendingIds ?? {})).toEqual([[]]);
+    expect(
+      Object.values(
+        finalState.langsmith?.lastAcknowledgedTransactions ?? {},
+      )[0],
+    ).toMatchObject({
+      acquisition: {
+        pendingRootIdsCarriedMissing: 0,
+        pendingRootIdsRequested: 1,
+        pendingRootRunsRefreshed: 1,
+        uniqueRootRunsEvaluated: 1,
+        windowRootRunsFetched: 0,
+      },
+      coverage: { pendingRootIdsAfter: 0 },
+    });
   });
 
   test("emits only new or changed turns from the overlap window", async () => {
@@ -390,16 +627,80 @@ describe("LangSmith connector", () => {
 
     const first = await connector.ingest(options);
     expect(first.status).toBe("success");
-    await connector.acknowledge?.(first);
+    await acknowledgeConnector(connector, first);
 
     const unchanged = await connector.ingest(options);
     expect(unchanged).toMatchObject({ rawFiles: [], status: "skipped" });
-    await connector.acknowledge?.(unchanged);
+    await acknowledgeConnector(connector, unchanged);
+    const unchangedState = await readJson<ConnectorStateFile>(
+      getStatePath(home),
+    );
+    expect(
+      Object.values(
+        unchangedState.langsmith?.lastAcknowledgedTransactions ?? {},
+      )[0],
+    ).toMatchObject({
+      acquisition: {
+        uniqueRootRunsEvaluated: 1,
+        windowRootRunsFetched: 1,
+      },
+      connectorStatus: "skipped",
+      coverage: {
+        changedLogicalTurns: 0,
+        changedTerminalRootRuns: 0,
+        changedThreads: 0,
+        completeWindow: true,
+        logicalTurnsEvaluated: 1,
+        threadsEvaluated: 1,
+      },
+      checkpoint: { advanced: true },
+      rawEvidenceFileCount: 0,
+      synthesisOutcome: "not_required",
+    });
 
     assistantText = "updated version";
     const changed = await connector.ingest(options);
     expect(changed.status).toBe("success");
     expect(changed.rawFiles).toHaveLength(2);
+  });
+
+  test("retains exact acknowledged coverage beyond the capped run history", async () => {
+    const home = await createTempHome();
+    let queryCount = 0;
+    const api = createFakeApi({
+      queryRootRuns: () =>
+        Promise.resolve({
+          runs: [createRun(1)],
+          truncated: false,
+        }),
+    });
+    const { createLangSmithConnector } = await loadConnector(home);
+    const connector = createLangSmithConnector({
+      createApi: () => api,
+      now: () =>
+        new Date(Date.parse("2026-07-16T00:00:00.000Z") + queryCount++ * 1000),
+    });
+    const options = createOptions();
+
+    for (let index = 0; index < 22; index += 1) {
+      const result = await connector.ingest(options);
+      await acknowledgeConnector(connector, result);
+    }
+
+    const state = await readJson<ConnectorStateFile>(getStatePath(home));
+    expect(state.runs).toHaveLength(20);
+    expect(
+      Object.values(state.langsmith?.lastAcknowledgedTransactions ?? {})[0],
+    ).toMatchObject({
+      connectorStatus: "skipped",
+      coverage: {
+        changedLogicalTurns: 0,
+        logicalTurnsEvaluated: 1,
+        threadsEvaluated: 1,
+      },
+      fetchedAt: "2026-07-16T00:00:21.000Z",
+      rawEvidenceFileCount: 0,
+    });
   });
 
   test("segments historical backfills into bounded time windows with overlap", async () => {
@@ -423,7 +724,7 @@ describe("LangSmith connector", () => {
     });
 
     const first = await connector.ingest(options);
-    await connector.acknowledge?.(first);
+    await acknowledgeConnector(connector, first);
     const second = await connector.ingest(options);
 
     expect(windows).toEqual([
@@ -488,7 +789,7 @@ describe("LangSmith connector", () => {
         apiUrl: "https://eu.api.smith.langchain.com",
       },
     });
-    await connector.acknowledge?.(eu);
+    await acknowledgeConnector(connector, eu);
     await connector.ingest({
       ...base,
       connectorConfig: {
@@ -646,6 +947,17 @@ async function loadConnector(home: string, setKey = true) {
   return await import("../src/connectors/sources/langsmith/index.ts");
 }
 
+async function acknowledgeConnector(
+  connector: Pick<ConnectorRuntime, "acknowledge">,
+  result: ConnectorIngestResult,
+  synthesisOutcome: ConnectorAcknowledgeResult["synthesisOutcome"] = result.status ===
+  "success"
+    ? "updated"
+    : undefined,
+): Promise<void> {
+  await connector.acknowledge?.({ ...result, synthesisOutcome });
+}
+
 function createFakeApi(overrides: Partial<LangSmithApi> = {}): LangSmithApi {
   return {
     close: () => undefined,
@@ -777,14 +1089,89 @@ type LangSmithManifest = {
 
 type ConnectorStateFile = {
   langsmith?: {
-    pendingBatches?: Record<string, unknown>;
+    lastAcknowledgedTransactions?: Record<
+      string,
+      | {
+          acquisition: {
+            pendingRootIdsCarriedMissing: number;
+            pendingRootIdsRequested: number;
+            pendingRootRunsRefreshed: number;
+            uniqueRootRunsEvaluated: number;
+            windowRootRunsFetched: number;
+          };
+          checkpoint: {
+            advanced: boolean;
+            successfulThroughAfter: string | null;
+            successfulThroughBefore: string | null;
+          };
+          connectorId: "langsmith";
+          connectorStatus: "skipped" | "success";
+          coverage: {
+            changedLogicalTurns: number;
+            changedTerminalRootRuns: number;
+            changedThreads: number;
+            completeWindow: boolean;
+            duplicateRootsEvaluated: number;
+            excludedByScope: number;
+            excludedByTagOrOpenWikiMetadata: number;
+            logicalTurnsEvaluated: number;
+            pendingRootIdsAfter: number;
+            terminalRootRunsEligible: number;
+            threadsEvaluated: number;
+          };
+          endpoint: string;
+          fetchedAt: string;
+          instanceId: string | null;
+          project: { id: string; name: string };
+          query: { since: string; until: string };
+          rawEvidenceFileCount: number;
+          replayed: boolean;
+          runId: string;
+          schemaVersion: 1;
+          scope: {
+            excludeTags: string[];
+            includeCwdPrefixes: string[];
+            kind: "root-runs";
+          };
+          synthesisOutcome: "no_changes" | "not_required" | "updated";
+          warnings: string[];
+        }
+      | {
+          acknowledgedAt: string;
+          checkpoint: {
+            advanced: boolean;
+            successfulThroughAfter: string | null;
+            successfulThroughBefore: string | null;
+          };
+          connectorId: "langsmith";
+          connectorStatus: "skipped" | "success";
+          query: { since: string; until: string };
+          rawEvidenceFileCount: number;
+          reason: "staged-before-transaction-provenance";
+          replayed: boolean;
+          runId: string;
+          schemaVersion: 0;
+        }
+    >;
+    pendingBatches?: Record<string, object>;
+    seenHashes?: Record<string, Record<string, string>>;
   };
   latestIds?: Record<string, string>;
   pendingIds?: Record<string, string[]>;
+  runs?: Array<{
+    at: string;
+    rawFiles: string[];
+    runId: string;
+    status: "error" | "skipped" | "success";
+    warnings: string[];
+  }>;
 };
 
 type LegacyConnectorStateFile = {
   langsmith?: {
-    pendingBatches?: Record<string, { selectionKey?: string }>;
+    pendingBatches?: Record<
+      string,
+      { selectionKey?: string; transaction?: { schemaVersion: number } }
+    >;
   };
 };

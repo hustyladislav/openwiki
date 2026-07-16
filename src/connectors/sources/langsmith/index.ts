@@ -15,6 +15,7 @@ import {
   writeRawJson,
 } from "../../io.js";
 import type {
+  ConnectorAcknowledgeResult,
   ConnectorDefinition,
   ConnectorIngestOptions,
   ConnectorIngestResult,
@@ -59,11 +60,105 @@ type LangSmithStagedBatch = {
   runId: string;
   selectionKey?: string;
   status: ConnectorIngestResult["status"];
+  transaction?: LangSmithStagedTransaction;
   warnings: string[];
 };
 
+type LangSmithCoverage = Readonly<{
+  completeWindow: boolean;
+  duplicateRoots: number;
+  excludedByScope: number;
+  excludedByTag: number;
+  logicalTurns: number;
+  logicalTurnsInWindow: number;
+  pendingRoots: number;
+  rootRunsChanged: number;
+  rootRunsFetched: number;
+  rootRunsIncluded: number;
+  rootRunsQueried: number;
+  scope: "root-runs";
+  threads: number;
+}>;
+
+type LangSmithAcknowledgedTransactionV1 = Readonly<{
+  acquisition: Readonly<{
+    pendingRootIdsCarriedMissing: number;
+    pendingRootIdsRequested: number;
+    pendingRootRunsRefreshed: number;
+    uniqueRootRunsEvaluated: number;
+    windowRootRunsFetched: number;
+  }>;
+  checkpoint: Readonly<{
+    advanced: boolean;
+    successfulThroughAfter: string | null;
+    successfulThroughBefore: string | null;
+  }>;
+  connectorId: "langsmith";
+  connectorStatus: "skipped" | "success";
+  coverage: Readonly<{
+    changedLogicalTurns: number;
+    changedTerminalRootRuns: number;
+    changedThreads: number;
+    completeWindow: boolean;
+    duplicateRootsEvaluated: number;
+    excludedByScope: number;
+    excludedByTagOrOpenWikiMetadata: number;
+    logicalTurnsEvaluated: number;
+    pendingRootIdsAfter: number;
+    terminalRootRunsEligible: number;
+    threadsEvaluated: number;
+  }>;
+  endpoint: string;
+  fetchedAt: string;
+  instanceId: string | null;
+  project: LangSmithProjectIdentity;
+  query: Readonly<{ since: string; until: string }>;
+  rawEvidenceFileCount: number;
+  replayed: boolean;
+  runId: string;
+  schemaVersion: 1;
+  scope: Readonly<{
+    excludeTags: ReadonlyArray<string>;
+    includeCwdPrefixes: ReadonlyArray<string>;
+    kind: "root-runs";
+  }>;
+  synthesisOutcome:
+    | NonNullable<ConnectorAcknowledgeResult["synthesisOutcome"]>
+    | "not_required";
+  warnings: ReadonlyArray<string>;
+}>;
+
+type LangSmithStagedTransaction = Omit<
+  LangSmithAcknowledgedTransactionV1,
+  "replayed" | "synthesisOutcome"
+>;
+
+type LangSmithLegacyAcknowledgedTransaction = Readonly<{
+  acknowledgedAt: string;
+  checkpoint: Readonly<{
+    advanced: boolean;
+    successfulThroughAfter: string | null;
+    successfulThroughBefore: string | null;
+  }>;
+  connectorId: "langsmith";
+  connectorStatus: "skipped" | "success";
+  query: Readonly<{ since: string; until: string }>;
+  rawEvidenceFileCount: number;
+  reason: "staged-before-transaction-provenance";
+  replayed: boolean;
+  runId: string;
+  schemaVersion: 0;
+}>;
+
+type LangSmithAcknowledgedTransaction =
+  LangSmithAcknowledgedTransactionV1 | LangSmithLegacyAcknowledgedTransaction;
+
 type LangSmithConnectorState = ConnectorState & {
   langsmith?: {
+    lastAcknowledgedTransactions?: Record<
+      string,
+      LangSmithAcknowledgedTransaction
+    >;
     pendingBatches?: Record<string, LangSmithStagedBatch>;
     seenHashes?: Record<string, Record<string, string>>;
   };
@@ -95,7 +190,7 @@ export function createLangSmithConnector(
   };
 }
 
-async function acknowledge(result: ConnectorIngestResult): Promise<void> {
+async function acknowledge(result: ConnectorAcknowledgeResult): Promise<void> {
   if (result.connectorId !== "langsmith" || !result.checkpointToken) {
     return;
   }
@@ -118,6 +213,59 @@ async function acknowledge(result: ConnectorIngestResult): Promise<void> {
     ...(state.langsmith?.pendingBatches ?? {}),
   };
   delete pendingBatches[checkpointKey];
+  if (result.status !== batch.status) {
+    throw new Error(
+      "LangSmith checkpoint acknowledgement status does not match its staged batch.",
+    );
+  }
+  const successfulThroughBefore = state.latestIds?.[checkpointKey] ?? null;
+  const successfulThroughAfter = batch.nextCursor ?? successfulThroughBefore;
+  const checkpointAdvanced = successfulThroughAfter !== successfulThroughBefore;
+  const connectorStatus = requireAcknowledgedStatus(batch.status);
+  const synthesisOutcome = resolveSynthesisOutcome(batch, result);
+  let acknowledgedTransaction: LangSmithAcknowledgedTransaction;
+
+  if (batch.transaction) {
+    if (
+      successfulThroughBefore !==
+      batch.transaction.checkpoint.successfulThroughBefore
+    ) {
+      throw new Error(
+        "LangSmith successful-through checkpoint changed before acknowledgement.",
+      );
+    }
+    if (
+      batch.transaction.checkpoint.advanced !== checkpointAdvanced ||
+      batch.transaction.checkpoint.successfulThroughAfter !==
+        successfulThroughAfter
+    ) {
+      throw new Error(
+        "LangSmith staged checkpoint provenance is inconsistent.",
+      );
+    }
+    acknowledgedTransaction = {
+      ...batch.transaction,
+      replayed: result.replayed === true,
+      synthesisOutcome,
+    };
+  } else {
+    acknowledgedTransaction = {
+      acknowledgedAt: new Date().toISOString(),
+      checkpoint: {
+        advanced: checkpointAdvanced,
+        successfulThroughAfter,
+        successfulThroughBefore,
+      },
+      connectorId: "langsmith",
+      connectorStatus,
+      query: batch.queryWindow,
+      rawEvidenceFileCount: batch.rawFiles.length,
+      reason: "staged-before-transaction-provenance",
+      replayed: result.replayed === true,
+      runId: batch.runId,
+      schemaVersion: 0,
+    };
+  }
   const nextState: LangSmithConnectorState = {
     ...state,
     latestIds: batch.nextCursor
@@ -132,6 +280,10 @@ async function acknowledge(result: ConnectorIngestResult): Promise<void> {
     },
     langsmith: {
       ...state.langsmith,
+      lastAcknowledgedTransactions: {
+        ...(state.langsmith?.lastAcknowledgedTransactions ?? {}),
+        [checkpointKey]: acknowledgedTransaction,
+      },
       pendingBatches,
       seenHashes: {
         ...(state.langsmith?.seenHashes ?? {}),
@@ -141,6 +293,41 @@ async function acknowledge(result: ConnectorIngestResult): Promise<void> {
   };
 
   await writeConnectorState("langsmith", nextState);
+}
+
+function requireAcknowledgedStatus(
+  status: ConnectorIngestResult["status"],
+): "skipped" | "success" {
+  if (status !== "skipped" && status !== "success") {
+    throw new Error(
+      "LangSmith staged batch has an invalid acknowledged status.",
+    );
+  }
+  return status;
+}
+
+function resolveSynthesisOutcome(
+  batch: LangSmithStagedBatch,
+  result: ConnectorAcknowledgeResult,
+): LangSmithAcknowledgedTransactionV1["synthesisOutcome"] {
+  if (batch.status === "skipped") {
+    if (result.synthesisOutcome !== undefined) {
+      throw new Error(
+        "LangSmith skipped batches cannot have a synthesis outcome.",
+      );
+    }
+    return "not_required";
+  }
+  if (
+    batch.status === "success" &&
+    (result.synthesisOutcome === "updated" ||
+      result.synthesisOutcome === "no_changes")
+  ) {
+    return result.synthesisOutcome;
+  }
+  throw new Error(
+    "LangSmith successful batches require a valid synthesis outcome before acknowledgement.",
+  );
 }
 
 async function ingest(
@@ -260,13 +447,18 @@ async function ingest(
     const previousPendingIds = state.pendingIds?.[checkpointKey] ?? [];
     const pendingRefresh = await api.readRuns(previousPendingIds);
     const mergedRuns = mergeRunsById(pull.runs, pendingRefresh);
-    const excludedByTag = excludeRuns(
-      mergedRuns,
+    const mergedRunIds = new Set(mergedRuns.map((run) => run.id));
+    const pendingRootIdsCarriedMissing = previousPendingIds.filter(
+      (pendingId) => !mergedRunIds.has(pendingId),
+    ).length;
+    const excludeTags = normalizeExcludedTags(
       config.excludeTags ?? ["openwiki"],
     );
+    const includeCwdPrefixes = normalizeCwdPrefixes(config.includeCwdPrefixes);
+    const excludedByTag = excludeRuns(mergedRuns, excludeTags);
     const scoped = includeRunsInScope(
       excludedByTag.included,
-      config.includeCwdPrefixes,
+      includeCwdPrefixes,
     );
     const eligibleRuns = scoped.included.filter(
       (run) => run.status !== "pending",
@@ -291,6 +483,21 @@ async function ingest(
       apiUrl,
     );
     const compact = selectChangedTurns(compactAll, changedRunIds);
+    const coverage: LangSmithCoverage = {
+      completeWindow: !pull.truncated,
+      duplicateRoots: compactAll.duplicateRuns,
+      excludedByScope: scoped.excluded,
+      excludedByTag: excludedByTag.excluded,
+      logicalTurns: compact.logicalTurns,
+      logicalTurnsInWindow: compactAll.logicalTurns,
+      pendingRoots: nextPendingIds.length,
+      rootRunsChanged: changedRunIds.size,
+      rootRunsFetched: mergedRuns.length,
+      rootRunsIncluded: eligibleRuns.length,
+      rootRunsQueried: pull.runs.length,
+      scope: "root-runs",
+      threads: compact.threads.length,
+    };
     const threadManifest = [];
     const threadRawFiles: string[] = [];
 
@@ -310,20 +517,7 @@ async function ingest(
         "manifest.json",
         {
           connectorId: "langsmith",
-          coverage: {
-            completeWindow: !pull.truncated,
-            duplicateRoots: compactAll.duplicateRuns,
-            excludedByScope: scoped.excluded,
-            excludedByTag: excludedByTag.excluded,
-            logicalTurns: compact.logicalTurns,
-            logicalTurnsInWindow: compactAll.logicalTurns,
-            pendingRoots: nextPendingIds.length,
-            rootRunsChanged: changedRunIds.size,
-            rootRunsFetched: mergedRuns.length,
-            rootRunsIncluded: eligibleRuns.length,
-            scope: "root-runs",
-            threads: compact.threads.length,
-          },
+          coverage,
           fetchedAt: now.toISOString(),
           instanceId: options.instanceId ?? null,
           project: manifestProjectIdentity,
@@ -351,10 +545,56 @@ async function ingest(
         ? `Pulled ${pull.runs.length} LangSmith root run(s); ${compact.logicalTurns} new or changed logical turn(s) across ${compact.threads.length} thread(s) are ready for synthesis.`
         : `Pulled ${pull.runs.length} LangSmith root run(s); no new or changed terminal turns require synthesis.`;
     const checkpointToken = randomUUID();
+    const successfulThroughBefore = state.latestIds?.[checkpointKey] ?? null;
+    const nextCursor = pull.truncated ? undefined : window.until;
+    const successfulThroughAfter = nextCursor ?? successfulThroughBefore;
+    const transaction: LangSmithStagedTransaction = {
+      acquisition: {
+        pendingRootIdsCarriedMissing,
+        pendingRootIdsRequested: previousPendingIds.length,
+        pendingRootRunsRefreshed: pendingRefresh.length,
+        uniqueRootRunsEvaluated: mergedRuns.length,
+        windowRootRunsFetched: pull.runs.length,
+      },
+      checkpoint: {
+        advanced: successfulThroughAfter !== successfulThroughBefore,
+        successfulThroughAfter,
+        successfulThroughBefore,
+      },
+      connectorId: "langsmith",
+      connectorStatus: status,
+      coverage: {
+        changedLogicalTurns: compact.logicalTurns,
+        changedTerminalRootRuns: changedRunIds.size,
+        changedThreads: compact.threads.length,
+        completeWindow: !pull.truncated,
+        duplicateRootsEvaluated: compactAll.duplicateRuns,
+        excludedByScope: scoped.excluded,
+        excludedByTagOrOpenWikiMetadata: excludedByTag.excluded,
+        logicalTurnsEvaluated: compactAll.logicalTurns,
+        pendingRootIdsAfter: nextPendingIds.length,
+        terminalRootRunsEligible: eligibleRuns.length,
+        threadsEvaluated: compactAll.threads.length,
+      },
+      endpoint: apiUrl,
+      fetchedAt: now.toISOString(),
+      instanceId: options.instanceId ?? null,
+      project: manifestProjectIdentity,
+      query: window,
+      rawEvidenceFileCount: rawFiles.length,
+      runId,
+      schemaVersion: 1,
+      scope: {
+        excludeTags,
+        includeCwdPrefixes,
+        kind: "root-runs",
+      },
+      warnings: [...warnings],
+    };
     const stagedBatch: LangSmithStagedBatch = {
       checkpointToken,
       message,
-      nextCursor: pull.truncated ? undefined : window.until,
+      nextCursor,
       nextPendingIds,
       nextSeenHashes: pull.truncated
         ? { ...previousHashes, ...currentHashes }
@@ -364,6 +604,7 @@ async function ingest(
       runId,
       selectionKey,
       status,
+      transaction,
       warnings,
     };
     const nextState = updateStateWithRun(state, {
@@ -621,6 +862,25 @@ function rejectOpenWikiTraceProject(
       `LangSmith source project ${project.name} is also OpenWiki's tracing project. Set allowOpenWikiProject=true only if self-ingestion is intentional.`,
     );
   }
+}
+
+function normalizeCwdPrefixes(cwdPrefixes: string[] | undefined): string[] {
+  return [
+    ...new Set(
+      (cwdPrefixes ?? [])
+        .map((prefix) => prefix.trim())
+        .filter(Boolean)
+        .map((prefix) => path.resolve(prefix)),
+    ),
+  ].sort();
+}
+
+function normalizeExcludedTags(excludedTags: string[]): string[] {
+  return [
+    ...new Set(
+      excludedTags.map((tag) => tag.trim().toLowerCase()).filter(Boolean),
+    ),
+  ].sort();
 }
 
 function includeRunsInScope(

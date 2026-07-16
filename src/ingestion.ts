@@ -216,7 +216,10 @@ async function runSourceIngestion({
     });
     if (deterministicPull) {
       assertSynthesisCompleted(agentResult, connector.id);
-      await connector.acknowledge?.(deterministicPull);
+      await connector.acknowledge?.({
+        ...deterministicPull,
+        synthesisOutcome: agentResult.sourceUpdateReceipt?.outcome,
+      });
     }
 
     return {

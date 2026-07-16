@@ -44,8 +44,12 @@ export type ConnectorIngestResult = {
   warnings: string[];
 };
 
+export type ConnectorAcknowledgeResult = ConnectorIngestResult & {
+  synthesisOutcome?: ConnectorSourceUpdateReceipt["outcome"];
+};
+
 export type ConnectorRuntime = ConnectorDefinition & {
-  acknowledge?: (result: ConnectorIngestResult) => Promise<void>;
+  acknowledge?: (result: ConnectorAcknowledgeResult) => Promise<void>;
   ingest: (options?: ConnectorIngestOptions) => Promise<ConnectorIngestResult>;
 };
 
