@@ -95,9 +95,14 @@ describe("deterministic source update tools", () => {
       }),
     ).rejects.toThrow("exact raw files declared");
 
-    await expect(
-      completeTool.invoke({ outcome: "no_changes", summary: "No changes." }),
-    ).rejects.toThrow("reading every raw file in full");
+    const initialCompletion = parseCompletionResult(
+      await completeTool.invoke({
+        outcome: "no_changes",
+        summary: "No changes.",
+      }),
+    );
+    expect(initialCompletion.completed).toBe(false);
+    expect(initialCompletion.error).toContain("reading every raw file in full");
 
     const firstPage = JSON.parse(
       String(
@@ -117,9 +122,14 @@ describe("deterministic source update tools", () => {
       path: "run-1/manifest.json",
     });
 
-    await expect(
-      completeTool.invoke({ outcome: "no_changes", summary: "No changes." }),
-    ).rejects.toThrow("reading every raw file in full");
+    const partialCompletion = parseCompletionResult(
+      await completeTool.invoke({
+        outcome: "no_changes",
+        summary: "No changes.",
+      }),
+    );
+    expect(partialCompletion.completed).toBe(false);
+    expect(partialCompletion.error).toContain("reading every raw file in full");
 
     await readTool.invoke({
       connectorId: "langsmith",
@@ -251,12 +261,16 @@ describe("deterministic source update tools", () => {
 
       if (page.truncated) {
         expect(page.totalCharacters).toBeNull();
-        await expect(
-          completeTool.invoke({
+        const partialCompletion = parseCompletionResult(
+          await completeTool.invoke({
             outcome: "no_changes",
             summary: "Not finished.",
           }),
-        ).rejects.toThrow("reading every raw file in full");
+        );
+        expect(partialCompletion.completed).toBe(false);
+        expect(partialCompletion.error).toContain(
+          "reading every raw file in full",
+        );
       }
     } while (pages.at(-1)?.truncated);
 
@@ -351,4 +365,14 @@ function isHighSurrogate(codeUnit: number): boolean {
 
 function isLowSurrogate(codeUnit: number): boolean {
   return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
+function parseCompletionResult(value: unknown): {
+  completed: boolean;
+  error?: string;
+} {
+  return JSON.parse(String(value)) as {
+    completed: boolean;
+    error?: string;
+  };
 }

@@ -58,6 +58,8 @@ type ReadRange = {
   start: number;
 };
 
+class SourceUpdateCompletionError extends Error {}
+
 // DeepAgents offloads tool results above roughly 80k characters before the
 // model sees them. Keep each JSON-encoded page comfortably below that boundary;
 // offset paging remains unbounded across the complete file.
@@ -285,7 +287,7 @@ function createCompleteSourceUpdateTool(
   return new DynamicStructuredTool({
     name: "openwiki_complete_source_update",
     description:
-      "Complete the current deterministic source update only after every required raw file has been read in full and synthesis is finished. Use outcome=updated after durable wiki changes, or outcome=no_changes when the evidence contains no new durable knowledge.",
+      "Complete the current deterministic source update only after every required raw file has been read in full and synthesis is finished. Use outcome=updated after durable wiki changes, or outcome=no_changes when the evidence contains no new durable knowledge. If the result says completed=false, read every listed missing file through EOF and call this tool again.",
     schema: {
       type: "object",
       properties: {
@@ -302,14 +304,26 @@ function createCompleteSourceUpdateTool(
     } as const,
     func: (input) => {
       const outcome = getSourceUpdateOutcome(input, "outcome");
-      const receipt = tracker.complete(
-        outcome,
-        getStringInput(input, "summary"),
-      );
-      onReceipt?.(receipt);
-      return Promise.resolve(
-        stringifyToolResult({ completed: true, ...receipt }),
-      );
+      try {
+        const receipt = tracker.complete(
+          outcome,
+          getStringInput(input, "summary"),
+        );
+        onReceipt?.(receipt);
+        return Promise.resolve(
+          stringifyToolResult({ completed: true, ...receipt }),
+        );
+      } catch (error) {
+        if (!(error instanceof SourceUpdateCompletionError)) throw error;
+        return Promise.resolve(
+          stringifyToolResult({
+            completed: false,
+            error: error.message,
+            instruction:
+              "Read the missing raw files through EOF, then call this tool again.",
+          }),
+        );
+      }
     },
   });
 }
@@ -359,7 +373,7 @@ export function createSourceUpdateReceiptTracker(
         return total === undefined || !coversWholeFile(ranges, total);
       });
       if (missingFiles.length > 0) {
-        throw new Error(
+        throw new SourceUpdateCompletionError(
           `Cannot complete source update before reading every raw file in full: ${missingFiles
             .map(([, relativePath]) => relativePath)
             .join(", ")}`,
@@ -368,7 +382,9 @@ export function createSourceUpdateReceiptTracker(
 
       const normalizedSummary = summary.trim();
       if (!normalizedSummary) {
-        throw new Error("Source update completion summary must not be empty.");
+        throw new SourceUpdateCompletionError(
+          "Source update completion summary must not be empty.",
+        );
       }
 
       receipt = {
