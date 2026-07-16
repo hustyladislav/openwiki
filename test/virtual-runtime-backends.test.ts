@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { FilesystemBackend } from "deepagents";
 import { afterEach, describe, expect, test } from "vitest";
+import { synchronizeWikiIndexes } from "../src/agent/index-middleware.ts";
 import { createSystemPrompt } from "../src/agent/prompt.ts";
 import {
   createOpenWikiCompositeBackend,
@@ -89,6 +90,27 @@ describe("OpenWiki virtual runtime backends", () => {
     ).resolves.toMatchObject({ path: "/memory.md" });
   });
 
+  test("keeps runtime routes out of deterministic wiki indexes", async () => {
+    const { backend, wikiRoot } = await createBackend();
+
+    await synchronizeWikiIndexes(backend, "local-wiki");
+
+    const index = await readFile(path.join(wikiRoot, "index.md"), "utf8");
+    expect(index).toContain("[quickstart](quickstart.md)");
+    expect(index).not.toContain("conversation_history");
+    expect(index).not.toContain("large_tool_results");
+    expect(index).not.toContain("[skills](skills/)");
+    for (const runtimeDirectory of [
+      "conversation_history",
+      "large_tool_results",
+      "skills",
+    ]) {
+      await expect(
+        readFile(path.join(wikiRoot, runtimeDirectory, "index.md"), "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
   test("labels runtime routes as non-wiki infrastructure", async () => {
     const systemPrompt = createSystemPrompt("update", "local-wiki");
     const migrationSkill = await readFile(
@@ -115,6 +137,7 @@ describe("OpenWiki virtual runtime backends", () => {
 async function createBackend(): Promise<{
   backend: OpenWikiCompositeBackend;
   skillPath: string;
+  wikiRoot: string;
 }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "openwiki-runtime-"));
   temporaryRoots.push(root);
@@ -143,5 +166,5 @@ async function createBackend(): Promise<{
     new FilesystemBackend({ rootDir: wikiRoot, virtualMode: true }),
     skillsRoot,
   );
-  return { backend, skillPath };
+  return { backend, skillPath, wikiRoot };
 }

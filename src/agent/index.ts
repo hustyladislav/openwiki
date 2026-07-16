@@ -289,7 +289,7 @@ async function runOpenWikiAgentCore(
                 }),
               ]
             : []),
-          createOpenWikiSubagentMiddleware(wikiBackend, outputMode),
+          createOpenWikiSubagentMiddleware(backend, outputMode),
         ];
   const agent = createDeepAgent({
     model,
@@ -299,7 +299,7 @@ async function runOpenWikiAgentCore(
     middleware:
       command === "chat"
         ? []
-        : [createOpenWikiIndexMiddleware(wikiBackend, outputMode)],
+        : [createOpenWikiIndexMiddleware(backend, outputMode)],
     skills: ["/skills/"],
     subagents: [
       {
