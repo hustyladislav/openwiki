@@ -80,20 +80,44 @@ describe("deterministic source update tools", () => {
       throw new Error("Expected source update tools.");
     }
 
-    await expect(
-      readTool.invoke({
-        connectorId: "notion",
-        offsetCharacters: 0,
-        path: "run-1/manifest.json",
-      }),
-    ).rejects.toThrow("only read raw files for langsmith");
-    await expect(
-      readTool.invoke({
-        connectorId: "langsmith",
-        offsetCharacters: 0,
-        path: "run-1/unlisted.json",
-      }),
-    ).rejects.toThrow("exact raw files declared");
+    const wrongConnector = JSON.parse(
+      String(
+        await readTool.invoke({
+          connectorId: "notion",
+          offsetCharacters: 0,
+          path: "run-1/manifest.json",
+        }),
+      ),
+    ) as { allowed: boolean; error: string; instruction: string };
+    expect(wrongConnector.allowed).toBe(false);
+    expect(wrongConnector.error).toContain("only read raw files for langsmith");
+    expect(wrongConnector.instruction).toContain("No file was read");
+
+    const unlistedFile = JSON.parse(
+      String(
+        await readTool.invoke({
+          connectorId: "langsmith",
+          offsetCharacters: 0,
+          path: "run-1/unlisted.json",
+        }),
+      ),
+    ) as { allowed: boolean; error: string; instruction: string };
+    expect(unlistedFile.allowed).toBe(false);
+    expect(unlistedFile.error).toContain("exact raw files declared");
+    expect(unlistedFile.instruction).toContain("No file was read");
+
+    const outsideRawDirectory = JSON.parse(
+      String(
+        await readTool.invoke({
+          connectorId: "langsmith",
+          offsetCharacters: 0,
+          path: "../../outside.json",
+        }),
+      ),
+    ) as { allowed: boolean; error: string; instruction: string };
+    expect(outsideRawDirectory.allowed).toBe(false);
+    expect(outsideRawDirectory.error).toContain("exact raw files declared");
+    expect(outsideRawDirectory.instruction).toContain("No file was read");
 
     const initialCompletion = parseCompletionResult(
       await completeTool.invoke({

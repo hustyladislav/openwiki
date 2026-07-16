@@ -56,6 +56,7 @@ type ReadRange = {
 };
 
 class SourceUpdateCompletionError extends Error {}
+class SourceUpdateRawFileError extends Error {}
 
 // DeepAgents offloads tool results above roughly 80k characters before the
 // model sees them. Keep each JSON-encoded page comfortably below that boundary;
@@ -251,7 +252,17 @@ export function createOpenWikiConnectorTools(
       func: async (input) => {
         const connectorId = getConnectorId(input, "connectorId");
         const relativePath = getStringInput(input, "path");
-        sourceUpdateTracker?.assertAllowed(connectorId, relativePath);
+        try {
+          sourceUpdateTracker?.assertAllowed(connectorId, relativePath);
+        } catch (error) {
+          if (!(error instanceof SourceUpdateRawFileError)) throw error;
+          return stringifyToolResult({
+            allowed: false,
+            error: error.message,
+            instruction:
+              "No file was read. Retry with the configured connector ID and exactly one relative path from the deterministic pull's Raw data files list.",
+          });
+        }
         const result = await readRawItem(
           connectorId,
           relativePath,
@@ -347,16 +358,24 @@ export function createSourceUpdateReceiptTracker(
   return {
     assertAllowed(connectorId: ConnectorId, relativePath: string): void {
       if (connectorId !== sourceUpdate.connectorId) {
-        throw new Error(
-          `This source update may only read raw files for ${sourceUpdate.connectorId}.`,
+        throw new SourceUpdateRawFileError(
+          `This source update may only read raw files for ${sourceUpdate.connectorId}; received connector ${connectorId}.`,
         );
       }
-      const resolved = path.resolve(
-        resolveConnectorRawPath(connectorId, relativePath),
-      );
+      let resolved: string;
+      try {
+        resolved = path.resolve(
+          resolveConnectorRawPath(connectorId, relativePath),
+        );
+      } catch (error) {
+        throw new SourceUpdateRawFileError(
+          `This source update may only read the exact raw files declared by its deterministic pull; received path ${JSON.stringify(relativePath)}.`,
+          { cause: error },
+        );
+      }
       if (!requiredFiles.has(resolved)) {
-        throw new Error(
-          "This source update may only read the exact raw files declared by its deterministic pull.",
+        throw new SourceUpdateRawFileError(
+          `This source update may only read the exact raw files declared by its deterministic pull; received path ${JSON.stringify(relativePath)}.`,
         );
       }
     },
