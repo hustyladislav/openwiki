@@ -3,8 +3,9 @@ import {
   type StructuredToolInterface,
 } from "@langchain/core/tools";
 import { constants as fsConstants } from "node:fs";
-import { open, readdir, stat } from "node:fs/promises";
+import { type FileHandle, open, readdir, stat } from "node:fs/promises";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import {
   getConnectorConfigPath,
   getConnectorRawDir,
@@ -18,10 +19,59 @@ import {
   discoverMcpConnectorTools,
   isMcpConnectorId,
 } from "./mcp-runtime.js";
-import type { ConnectorId, ConnectorIngestOptions } from "./types.js";
+import type {
+  ConnectorId,
+  ConnectorIngestOptions,
+  ConnectorSourceUpdate,
+  ConnectorSourceUpdateReceipt,
+} from "./types.js";
 
-export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
-  return [
+type OpenWikiConnectorToolOptions = {
+  onSourceUpdateReceipt?: (receipt: ConnectorSourceUpdateReceipt) => void;
+  sourceUpdate?: ConnectorSourceUpdate;
+};
+
+type RawItemReadResult = {
+  connectorId: ConnectorId;
+  content: string;
+  filePath: string;
+  nextOffsetCharacters: number | null;
+  offsetCharacters: number;
+  totalCharacters: number | null;
+  truncated: boolean;
+};
+
+type RawItemCursorState = {
+  byteOffsetsByCharacter: Map<number, number>;
+  fileIdentity: string;
+  totalCharacters: number | null;
+};
+
+type Utf8Page = {
+  content: string;
+  endByteOffset: number;
+  isEndOfFile: boolean;
+};
+
+type ReadRange = {
+  end: number;
+  start: number;
+};
+
+// DeepAgents offloads tool results above roughly 80k characters before the
+// model sees them. Keep each JSON-encoded page comfortably below that boundary;
+// offset paging remains unbounded across the complete file.
+const RAW_ITEM_PAGE_MAX_CHARACTERS = 20_000;
+const RAW_ITEM_READ_CHUNK_MAX_BYTES = 64 * 1024;
+
+export function createOpenWikiConnectorTools(
+  options: OpenWikiConnectorToolOptions = {},
+): StructuredToolInterface[] {
+  const readRawItem = createRawItemReader();
+  const sourceUpdateTracker = options.sourceUpdate
+    ? createSourceUpdateReceiptTracker(options.sourceUpdate)
+    : null;
+  const tools = [
     new DynamicStructuredTool({
       name: "openwiki_list_connectors",
       description:
@@ -97,6 +147,7 @@ export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
               "git-repo",
               "google",
               "hackernews",
+              "langsmith",
               "notion",
               "slack",
               "web-search",
@@ -145,6 +196,7 @@ export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
               "git-repo",
               "google",
               "hackernews",
+              "langsmith",
               "notion",
               "slack",
               "web-search",
@@ -163,7 +215,7 @@ export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
     new DynamicStructuredTool({
       name: "openwiki_read_raw_item",
       description:
-        'Read a raw connector file by connector ID and relative path. Only files inside ~/.openwiki/connectors/<id>/raw are allowed. Input: {"connectorId":"x","path":"2026-.../bookmarks.json","maxBytes":50000}.',
+        'Read a raw connector file by connector ID and relative path. Only files inside ~/.openwiki/connectors/<id>/raw are allowed. Page long files with the exact returned nextOffsetCharacters; do not calculate offsets from content length. totalCharacters is null until the page reaches EOF. Input: {"connectorId":"x","path":"2026-.../bookmarks.json","maxBytes":50000,"offsetCharacters":0}.',
       schema: {
         type: "object",
         properties: {
@@ -173,6 +225,7 @@ export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
               "git-repo",
               "google",
               "hackernews",
+              "langsmith",
               "notion",
               "slack",
               "web-search",
@@ -180,6 +233,13 @@ export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
             ],
           },
           maxBytes: {
+            description:
+              "Legacy name for the requested UTF-16 character page size; capped at 20,000.",
+            type: "number",
+          },
+          offsetCharacters: {
+            description:
+              "UTF-16 cursor. Start at 0, then use the exact nextOffsetCharacters returned by the preceding page.",
             type: "number",
           },
           path: {
@@ -189,16 +249,164 @@ export function createOpenWikiConnectorTools(): StructuredToolInterface[] {
         required: ["connectorId", "path"],
         additionalProperties: false,
       } as const,
-      func: async (input) =>
-        stringifyToolResult(
-          await readRawItem(
-            getConnectorId(input, "connectorId"),
-            getStringInput(input, "path"),
-            getNumberInput(input, "maxBytes") ?? 100_000,
-          ),
-        ),
+      func: async (input) => {
+        const connectorId = getConnectorId(input, "connectorId");
+        const relativePath = getStringInput(input, "path");
+        sourceUpdateTracker?.assertAllowed(connectorId, relativePath);
+        const result = await readRawItem(
+          connectorId,
+          relativePath,
+          getNumberInput(input, "maxBytes") ?? RAW_ITEM_PAGE_MAX_CHARACTERS,
+          getNumberInput(input, "offsetCharacters") ?? 0,
+        );
+        sourceUpdateTracker?.recordRead(result);
+        return stringifyToolResult(result);
+      },
     }),
   ];
+
+  if (!sourceUpdateTracker) {
+    return tools;
+  }
+
+  return [
+    ...tools.filter((tool) => tool.name === "openwiki_read_raw_item"),
+    createCompleteSourceUpdateTool(
+      sourceUpdateTracker,
+      options.onSourceUpdateReceipt,
+    ),
+  ];
+}
+
+function createCompleteSourceUpdateTool(
+  tracker: ReturnType<typeof createSourceUpdateReceiptTracker>,
+  onReceipt: ((receipt: ConnectorSourceUpdateReceipt) => void) | undefined,
+): StructuredToolInterface {
+  return new DynamicStructuredTool({
+    name: "openwiki_complete_source_update",
+    description:
+      "Complete the current deterministic source update only after every required raw file has been read in full and synthesis is finished. Use outcome=updated after durable wiki changes, or outcome=no_changes when the evidence contains no new durable knowledge.",
+    schema: {
+      type: "object",
+      properties: {
+        outcome: {
+          type: "string",
+          enum: ["no_changes", "updated"],
+        },
+        summary: {
+          type: "string",
+        },
+      },
+      required: ["outcome", "summary"],
+      additionalProperties: false,
+    } as const,
+    func: (input) => {
+      const outcome = getSourceUpdateOutcome(input, "outcome");
+      const receipt = tracker.complete(
+        outcome,
+        getStringInput(input, "summary"),
+      );
+      onReceipt?.(receipt);
+      return Promise.resolve(
+        stringifyToolResult({ completed: true, ...receipt }),
+      );
+    },
+  });
+}
+
+export function createSourceUpdateReceiptTracker(
+  sourceUpdate: ConnectorSourceUpdate,
+) {
+  const rawDir = path.resolve(getConnectorRawDir(sourceUpdate.connectorId));
+  const requiredFiles = new Map(
+    sourceUpdate.rawFiles.map((filePath) => {
+      const resolved = path.resolve(filePath);
+      if (!isPathInside(rawDir, resolved)) {
+        throw new Error(
+          `Source update raw file must stay inside ${sourceUpdate.connectorId}'s raw directory.`,
+        );
+      }
+      return [resolved, path.relative(rawDir, resolved)] as const;
+    }),
+  );
+  const readRanges = new Map<string, ReadRange[]>();
+  const totalCharacters = new Map<string, number>();
+  let receipt: ConnectorSourceUpdateReceipt | undefined;
+
+  return {
+    assertAllowed(connectorId: ConnectorId, relativePath: string): void {
+      if (connectorId !== sourceUpdate.connectorId) {
+        throw new Error(
+          `This source update may only read raw files for ${sourceUpdate.connectorId}.`,
+        );
+      }
+      const resolved = path.resolve(
+        resolveConnectorRawPath(connectorId, relativePath),
+      );
+      if (!requiredFiles.has(resolved)) {
+        throw new Error(
+          "This source update may only read the exact raw files declared by its deterministic pull.",
+        );
+      }
+    },
+    complete(
+      outcome: ConnectorSourceUpdateReceipt["outcome"],
+      summary: string,
+    ): ConnectorSourceUpdateReceipt {
+      const missingFiles = [...requiredFiles].filter(([filePath]) => {
+        const ranges = mergeReadRanges(readRanges.get(filePath) ?? []);
+        const total = totalCharacters.get(filePath);
+        return total === undefined || !coversWholeFile(ranges, total);
+      });
+      if (missingFiles.length > 0) {
+        throw new Error(
+          `Cannot complete source update before reading every raw file in full: ${missingFiles
+            .map(([, relativePath]) => relativePath)
+            .join(", ")}`,
+        );
+      }
+
+      const normalizedSummary = summary.trim();
+      if (!normalizedSummary) {
+        throw new Error("Source update completion summary must not be empty.");
+      }
+
+      receipt = {
+        connectorId: sourceUpdate.connectorId,
+        outcome,
+        rawFilesRead: [...requiredFiles.values()].sort(),
+        summary: normalizedSummary,
+      };
+      return receipt;
+    },
+    getReceipt(): ConnectorSourceUpdateReceipt | undefined {
+      return receipt;
+    },
+    recordRead(result: RawItemReadResult): void {
+      if (result.connectorId !== sourceUpdate.connectorId) {
+        return;
+      }
+      const resolved = path.resolve(result.filePath);
+      if (!requiredFiles.has(resolved)) {
+        return;
+      }
+      const ranges = readRanges.get(resolved) ?? [];
+      const end =
+        result.nextOffsetCharacters ??
+        (result.truncated ? null : result.totalCharacters);
+      if (end === null) {
+        return;
+      }
+      ranges.push({
+        end,
+        start: result.offsetCharacters,
+      });
+      readRanges.set(resolved, ranges);
+      if (!result.truncated && result.totalCharacters !== null) {
+        totalCharacters.set(resolved, result.totalCharacters);
+      }
+    },
+  };
 }
 
 async function listConnectors() {
@@ -298,36 +506,218 @@ async function listRawItems(connectorId: ConnectorId) {
   };
 }
 
-async function readRawItem(
-  connectorId: ConnectorId,
-  relativePath: string,
-  maxBytes: number,
-) {
-  const filePath = resolveConnectorRawPath(connectorId, relativePath);
-  const fileHandle = await open(
-    filePath,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-  );
+function createRawItemReader() {
+  const cursorStates = new Map<string, RawItemCursorState>();
 
-  try {
-    const fileStat = await fileHandle.stat();
-
-    if (!fileStat.isFile()) {
-      throw new Error("Raw item path must point to a file.");
-    }
-
-    const content = await fileHandle.readFile("utf8");
-    const limit = Math.max(1, Math.min(maxBytes, 500_000));
-
-    return {
-      connectorId,
-      content: content.slice(0, limit),
+  return async function readRawItem(
+    connectorId: ConnectorId,
+    relativePath: string,
+    maxBytes: number,
+    offsetCharacters: number,
+  ): Promise<RawItemReadResult> {
+    const filePath = resolveConnectorRawPath(connectorId, relativePath);
+    const fileHandle = await open(
       filePath,
-      truncated: content.length > limit,
-    };
-  } finally {
-    await fileHandle.close();
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+
+    try {
+      const fileStat = await fileHandle.stat();
+
+      if (!fileStat.isFile()) {
+        throw new Error("Raw item path must point to a file.");
+      }
+
+      const fileIdentity = [
+        fileStat.dev,
+        fileStat.ino,
+        fileStat.size,
+        fileStat.mtimeMs,
+      ].join(":");
+      const cachedState = cursorStates.get(filePath);
+      const state =
+        cachedState?.fileIdentity === fileIdentity
+          ? cachedState
+          : {
+              byteOffsetsByCharacter: new Map([[0, 0]]),
+              fileIdentity,
+              totalCharacters: null,
+            };
+      cursorStates.set(filePath, state);
+
+      const requestedOffset = Math.max(0, Math.trunc(offsetCharacters));
+      const offset = await resolveCharacterOffset({
+        fileHandle,
+        fileSize: fileStat.size,
+        requestedOffset,
+        state,
+      });
+      const startByteOffset = state.byteOffsetsByCharacter.get(offset);
+      if (startByteOffset === undefined) {
+        throw new Error("Raw item cursor could not be resolved.");
+      }
+
+      const limit = Math.max(
+        1,
+        Math.min(Math.trunc(maxBytes), RAW_ITEM_PAGE_MAX_CHARACTERS),
+      );
+      const page = await readUtf8Page({
+        fileHandle,
+        fileSize: fileStat.size,
+        maxCharacters: limit,
+        startByteOffset,
+      });
+      const nextOffset = offset + page.content.length;
+      state.byteOffsetsByCharacter.set(nextOffset, page.endByteOffset);
+      if (page.isEndOfFile) {
+        state.totalCharacters = nextOffset;
+      }
+
+      const currentFileStat = await fileHandle.stat();
+      const currentFileIdentity = [
+        currentFileStat.dev,
+        currentFileStat.ino,
+        currentFileStat.size,
+        currentFileStat.mtimeMs,
+      ].join(":");
+      if (currentFileIdentity !== fileIdentity) {
+        cursorStates.delete(filePath);
+        throw new Error("Raw item changed while it was being read; retry.");
+      }
+
+      return {
+        connectorId,
+        content: page.content,
+        filePath,
+        nextOffsetCharacters: page.isEndOfFile ? null : nextOffset,
+        offsetCharacters: offset,
+        totalCharacters: page.isEndOfFile ? nextOffset : null,
+        truncated: !page.isEndOfFile,
+      };
+    } finally {
+      await fileHandle.close();
+    }
+  };
+}
+
+async function resolveCharacterOffset(options: {
+  fileHandle: FileHandle;
+  fileSize: number;
+  requestedOffset: number;
+  state: RawItemCursorState;
+}): Promise<number> {
+  const { fileHandle, fileSize, requestedOffset, state } = options;
+  if (
+    state.totalCharacters !== null &&
+    requestedOffset >= state.totalCharacters
+  ) {
+    return state.totalCharacters;
   }
+  if (state.byteOffsetsByCharacter.has(requestedOffset)) {
+    return requestedOffset;
+  }
+
+  let characterOffset = 0;
+  for (const knownOffset of state.byteOffsetsByCharacter.keys()) {
+    if (knownOffset < requestedOffset && knownOffset > characterOffset) {
+      characterOffset = knownOffset;
+    }
+  }
+  let byteOffset = state.byteOffsetsByCharacter.get(characterOffset) ?? 0;
+
+  while (characterOffset < requestedOffset) {
+    const charactersRemaining = requestedOffset - characterOffset;
+    const page = await readUtf8Page({
+      fileHandle,
+      fileSize,
+      maxCharacters: Math.min(
+        charactersRemaining,
+        RAW_ITEM_PAGE_MAX_CHARACTERS,
+      ),
+      startByteOffset: byteOffset,
+    });
+    const nextCharacterOffset = characterOffset + page.content.length;
+    if (nextCharacterOffset > requestedOffset) {
+      throw new Error(
+        "offsetCharacters splits a Unicode character; use an exact nextOffsetCharacters value returned by this tool.",
+      );
+    }
+    characterOffset = nextCharacterOffset;
+    byteOffset = page.endByteOffset;
+    state.byteOffsetsByCharacter.set(characterOffset, byteOffset);
+
+    if (page.isEndOfFile) {
+      state.totalCharacters = characterOffset;
+      return characterOffset;
+    }
+    if (page.content.length === 0) {
+      throw new Error("Raw item cursor did not advance.");
+    }
+  }
+
+  return characterOffset;
+}
+
+async function readUtf8Page(options: {
+  fileHandle: FileHandle;
+  fileSize: number;
+  maxCharacters: number;
+  startByteOffset: number;
+}): Promise<Utf8Page> {
+  const { fileHandle, fileSize, maxCharacters, startByteOffset } = options;
+  const decoder = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true,
+  });
+  let decoded = "";
+  let readPosition = startByteOffset;
+
+  while (decoded.length < maxCharacters && readPosition < fileSize) {
+    const bytesRemaining = fileSize - readPosition;
+    const buffer = Buffer.allocUnsafe(
+      Math.min(bytesRemaining, RAW_ITEM_READ_CHUNK_MAX_BYTES),
+    );
+    const { bytesRead } = await fileHandle.read(
+      buffer,
+      0,
+      buffer.length,
+      readPosition,
+    );
+    if (bytesRead === 0) {
+      throw new Error("Raw item ended before its reported file size.");
+    }
+    readPosition += bytesRead;
+    decoded += decoder.decode(buffer.subarray(0, bytesRead), {
+      stream: readPosition < fileSize,
+    });
+  }
+
+  const content = takeUtf16SafePrefix(decoded, maxCharacters);
+  const endByteOffset = startByteOffset + Buffer.byteLength(content, "utf8");
+
+  return {
+    content,
+    endByteOffset,
+    isEndOfFile: endByteOffset === fileSize,
+  };
+}
+
+function takeUtf16SafePrefix(content: string, maxCharacters: number): string {
+  if (content.length <= maxCharacters) {
+    return content;
+  }
+
+  const lastIncludedCodeUnit = content.charCodeAt(maxCharacters - 1);
+  const firstExcludedCodeUnit = content.charCodeAt(maxCharacters);
+  const endsWithHighSurrogate =
+    lastIncludedCodeUnit >= 0xd800 && lastIncludedCodeUnit <= 0xdbff;
+  const startsWithLowSurrogate =
+    firstExcludedCodeUnit >= 0xdc00 && firstExcludedCodeUnit <= 0xdfff;
+  const end =
+    endsWithHighSurrogate && startsWithLowSurrogate
+      ? maxCharacters + 1
+      : maxCharacters;
+  return content.slice(0, end);
 }
 
 async function listFiles(
@@ -405,6 +795,17 @@ function getStringInput(input: unknown, key: string): string {
   return input[key];
 }
 
+function getSourceUpdateOutcome(
+  input: unknown,
+  key: string,
+): ConnectorSourceUpdateReceipt["outcome"] {
+  const value = getStringInput(input, key);
+  if (value !== "no_changes" && value !== "updated") {
+    throw new Error(`Invalid source update outcome: ${value}`);
+  }
+  return value;
+}
+
 function getNumberInput(input: unknown, key: string): number | null {
   if (!isRecord(input) || input[key] === undefined) {
     return null;
@@ -451,6 +852,45 @@ function getStringArrayInput(
 
 function stringifyToolResult(value: unknown): string {
   return JSON.stringify(value, null, 2);
+}
+
+function mergeReadRanges(ranges: ReadRange[]): ReadRange[] {
+  const merged: ReadRange[] = [];
+  for (const range of [...ranges].sort(
+    (left, right) => left.start - right.start,
+  )) {
+    const previous = merged.at(-1);
+    if (!previous || range.start > previous.end) {
+      merged.push({ ...range });
+    } else {
+      previous.end = Math.max(previous.end, range.end);
+    }
+  }
+  return merged;
+}
+
+function coversWholeFile(
+  ranges: ReadRange[],
+  totalCharacters: number,
+): boolean {
+  if (totalCharacters === 0) {
+    return ranges.some((range) => range.start === 0 && range.end === 0);
+  }
+  return (
+    ranges.length === 1 &&
+    ranges[0]?.start === 0 &&
+    ranges[0].end >= totalCharacters
+  );
+}
+
+function isPathInside(rootDir: string, candidate: string): boolean {
+  const relative = path.relative(rootDir, candidate);
+  return (
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) &&
+      relative !== ".." &&
+      !path.isAbsolute(relative))
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

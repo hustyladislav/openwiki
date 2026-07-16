@@ -1,6 +1,8 @@
 import {
   LocalShellBackend,
   type EditResult,
+  type ExecuteResponse,
+  type FileUploadResponse,
   type LocalShellBackendOptions,
   type WriteResult,
 } from "deepagents";
@@ -12,16 +14,59 @@ export const MUTATION_PATH_METADATA_KEY = "openwikiMutationPath";
 type OpenWikiBackendOptions = LocalShellBackendOptions & {
   docsOnly?: boolean;
   outputMode?: OpenWikiOutputMode;
+  readOnly?: boolean;
+  shellDisabled?: boolean;
 };
 
 export class OpenWikiLocalShellBackend extends LocalShellBackend {
   private readonly docsOnly: boolean;
   private readonly outputMode: OpenWikiOutputMode;
+  private readonly readOnly: boolean;
+  private readonly shellDisabled: boolean;
 
   constructor(options: OpenWikiBackendOptions) {
     super(options);
     this.docsOnly = options.docsOnly === true;
     this.outputMode = options.outputMode ?? "repository";
+    this.readOnly = options.readOnly === true;
+    this.shellDisabled = this.readOnly || options.shellDisabled === true;
+  }
+
+  override async uploadFiles(
+    files: Array<[string, Uint8Array]>,
+  ): Promise<FileUploadResponse[]> {
+    if (this.readOnly) {
+      return files.map(([filePath]) => ({
+        error: "permission_denied",
+        path: filePath,
+      }));
+    }
+
+    if (!this.shellDisabled) {
+      return await super.uploadFiles(files);
+    }
+
+    const responses: FileUploadResponse[] = [];
+    for (const file of files) {
+      if (isTransientAgentPath(file[0])) {
+        responses.push({ error: "permission_denied", path: file[0] });
+      } else {
+        responses.push(...(await super.uploadFiles([file])));
+      }
+    }
+    return responses;
+  }
+
+  override async execute(command: string): Promise<ExecuteResponse> {
+    if (this.shellDisabled) {
+      return {
+        output: "OpenWiki shell execution is disabled for this run.",
+        exitCode: 1,
+        truncated: false,
+      };
+    }
+
+    return await super.execute(command);
   }
 
   override async write(
@@ -54,6 +99,14 @@ export class OpenWikiLocalShellBackend extends LocalShellBackend {
   }
 
   private getDocsOnlyWriteError(filePath: string): string | null {
+    if (this.readOnly) {
+      return "OpenWiki query mode is read-only; file writes are disabled.";
+    }
+
+    if (this.shellDisabled && isTransientAgentPath(filePath)) {
+      return "OpenWiki transient agent files must use ephemeral agent state.";
+    }
+
     if (
       !this.docsOnly ||
       this.outputMode === "local-wiki" ||
@@ -64,6 +117,19 @@ export class OpenWikiLocalShellBackend extends LocalShellBackend {
 
     return `OpenWiki repository init/update runs may only write under /${OPEN_WIKI_DIR}/. Refused path: ${filePath}`;
   }
+}
+
+function isTransientAgentPath(filePath: string): boolean {
+  const normalizedPath = filePath
+    .trim()
+    .replace(/\\/gu, "/")
+    .replace(/^\/+|\/+$/gu, "");
+  return (
+    normalizedPath === "conversation_history" ||
+    normalizedPath.startsWith("conversation_history/") ||
+    normalizedPath === "large_tool_results" ||
+    normalizedPath.startsWith("large_tool_results/")
+  );
 }
 
 /** Carries a successful mutation's file path into the ToolMessage metadata used by the validator. */

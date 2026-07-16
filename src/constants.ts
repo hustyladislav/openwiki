@@ -62,8 +62,50 @@ export const OPENWIKI_X_CLIENT_ID_ENV_KEY = "OPENWIKI_X_CLIENT_ID";
 export const OPENWIKI_X_CLIENT_SECRET_ENV_KEY = "OPENWIKI_X_CLIENT_SECRET";
 export const OPENWIKI_X_REFRESH_TOKEN_ENV_KEY = "OPENWIKI_X_REFRESH_TOKEN";
 export const OPENWIKI_TAVILY_API_KEY_ENV_KEY = "TAVILY_API_KEY";
+export const LANGSMITH_TRACING_API_KEY_ENV_KEY = "LANGSMITH_API_KEY";
+export const OPENWIKI_LANGSMITH_API_KEY_ENV_KEY = "OPENWIKI_LANGSMITH_API_KEY";
+// Kept as the connector-facing export consumed by the LangSmith connector.
+export const LANGSMITH_API_KEY_ENV_KEY = OPENWIKI_LANGSMITH_API_KEY_ENV_KEY;
+export const OPENWIKI_LANGSMITH_ENDPOINT_ENV_KEY =
+  "OPENWIKI_LANGSMITH_ENDPOINT";
+export const DEFAULT_OPENWIKI_LANGSMITH_ENDPOINT =
+  "https://api.smith.langchain.com";
+export const OPENWIKI_LANGSMITH_ENDPOINTS = [
+  DEFAULT_OPENWIKI_LANGSMITH_ENDPOINT,
+  "https://eu.api.smith.langchain.com",
+] as const;
 export const DEFAULT_PROVIDER = "openai";
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+
+export type OpenWikiLangSmithEndpoint =
+  (typeof OPENWIKI_LANGSMITH_ENDPOINTS)[number];
+
+export function normalizeOpenWikiLangSmithEndpoint(
+  value: string,
+): OpenWikiLangSmithEndpoint {
+  const normalized = value.trim().replace(/\/+$/u, "");
+  const endpoint = OPENWIKI_LANGSMITH_ENDPOINTS.find(
+    (candidate) => candidate === normalized,
+  );
+
+  if (!endpoint) {
+    throw new Error(
+      `LangSmith endpoint must be ${OPENWIKI_LANGSMITH_ENDPOINTS.join(" or ")}.`,
+    );
+  }
+
+  return endpoint;
+}
+
+export function resolveOpenWikiLangSmithEndpoint(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): OpenWikiLangSmithEndpoint {
+  const configured = env[OPENWIKI_LANGSMITH_ENDPOINT_ENV_KEY];
+
+  return configured?.trim()
+    ? normalizeOpenWikiLangSmithEndpoint(configured)
+    : DEFAULT_OPENWIKI_LANGSMITH_ENDPOINT;
+}
 
 export type OpenWikiProvider =
   | "anthropic"

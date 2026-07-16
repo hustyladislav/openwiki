@@ -35,6 +35,46 @@ afterEach(async () => {
 });
 
 describe("OpenWiki onboarding instructions", () => {
+  test("round-trips LangSmith source instances", async () => {
+    const home = await createTempHome();
+    const onboarding = await loadOnboardingModule(home);
+
+    await onboarding.saveOpenWikiOnboardingConfig({
+      sourceInstances: [
+        {
+          connectedAt: "2026-07-16T00:00:00.000Z",
+          connectorConfig: {
+            apiUrl: "https://eu.api.smith.langchain.com",
+            enabled: true,
+            projectName: "my-agent-project",
+          },
+          connectorId: "langsmith",
+          id: "langsmith-1",
+          ingestionGoal: "Extract durable memories.",
+        },
+      ],
+      sources: {},
+      version: 1,
+    });
+
+    const config = await onboarding.readOpenWikiOnboardingConfig();
+    expect(config.sourceInstances).toHaveLength(1);
+    expect(config.sourceInstances[0]).toMatchObject({
+      connectorConfig: {
+        apiUrl: "https://eu.api.smith.langchain.com",
+        projectName: "my-agent-project",
+      },
+      connectorId: "langsmith",
+      id: "langsmith-1",
+    });
+    expect(config.sources.langsmith).toMatchObject({
+      connectorConfig: {
+        apiUrl: "https://eu.api.smith.langchain.com",
+        projectName: "my-agent-project",
+      },
+    });
+  });
+
   test("saves wiki instructions to INSTRUCTIONS.md instead of onboarding.json", async () => {
     const home = await createTempHome();
     const onboarding = await loadOnboardingModule(home);

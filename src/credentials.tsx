@@ -7,6 +7,7 @@ import { Box, Text, useInput, useStdout } from "ink";
 import { configureAuthProvider } from "./auth/configure.js";
 import { runOAuthAuth } from "./auth/oauth.js";
 import {
+  DEFAULT_OPENWIKI_LANGSMITH_ENDPOINT,
   DEFAULT_PROVIDER,
   DEFAULT_VERTEX_LOCATION,
   getDefaultModelId,
@@ -19,15 +20,19 @@ import {
   getProviderProjectEnvKey,
   getProviderRegionEnvKey,
   getProviderSecretKeyEnvKey,
+  LANGSMITH_API_KEY_ENV_KEY,
+  LANGSMITH_TRACING_API_KEY_ENV_KEY,
   providerRequiresApiKey,
   isValidBaseUrl,
   isValidModelId,
+  normalizeOpenWikiLangSmithEndpoint,
   normalizeProvider,
   normalizeModelId,
   OPENAI_CHATGPT_EMAIL_ENV_KEY,
   OPENAI_CHATGPT_PLAN_ENV_KEY,
   OPENWIKI_GOOGLE_CLIENT_ID_ENV_KEY,
   OPENWIKI_GOOGLE_CLIENT_SECRET_ENV_KEY,
+  OPENWIKI_LANGSMITH_ENDPOINT_ENV_KEY,
   OPENWIKI_MODEL_ID_ENV_KEY,
   OPENWIKI_PROVIDER_ENV_KEY,
   OPENWIKI_TAVILY_API_KEY_ENV_KEY,
@@ -38,6 +43,7 @@ import {
   providerRequiresSecretKey,
   providerUsesOAuth,
   resolveConfiguredProvider,
+  resolveOpenWikiLangSmithEndpoint,
   SELECTABLE_OPENWIKI_PROVIDERS,
 } from "./constants.js";
 import {
@@ -138,6 +144,7 @@ type SourceSetupOption = {
 };
 
 type SourceSecretInput = {
+  defaultValue?: string;
   envKey: string;
   label: string;
   optional?: boolean;
@@ -206,6 +213,7 @@ const ONBOARDING_TEMPLATES = [
       "notion",
       "web-search",
       "hackernews",
+      "langsmith",
       "x",
     ],
     suggestedSources: [
@@ -213,6 +221,7 @@ const ONBOARDING_TEMPLATES = [
       "Notion",
       "Web Search (Tavily)",
       "Hacker News",
+      "LangSmith",
       "X/Twitter",
     ],
     suggestedGoal:
@@ -330,6 +339,30 @@ const SOURCE_OPTIONS = [
     secretInputs: [],
   },
   {
+    displayName: "LangSmith",
+    examples: ["my-agent-project", "8c70b9c1-1234-4567-8901-123456789abc"],
+    id: "langsmith",
+    instructions: [
+      "Create a LangSmith personal access token with read access to runs.",
+      `Paste the connector key below; it is stored as ${LANGSMITH_API_KEY_ENV_KEY} in ~/.openwiki/.env.`,
+      `Choose the US or EU API endpoint. This connector key is separate from ${LANGSMITH_TRACING_API_KEY_ENV_KEY}, which only traces OpenWiki's own runs.`,
+      "On the next screen, enter exactly one LangSmith project name or project UUID.",
+    ],
+    secretInputs: [
+      {
+        envKey: LANGSMITH_API_KEY_ENV_KEY,
+        label: "LangSmith API key",
+        secret: true,
+      },
+      {
+        defaultValue: DEFAULT_OPENWIKI_LANGSMITH_ENDPOINT,
+        envKey: OPENWIKI_LANGSMITH_ENDPOINT_ENV_KEY,
+        label: "LangSmith API endpoint",
+        optional: true,
+      },
+    ],
+  },
+  {
     authProvider: "x",
     displayName: "X / Twitter",
     examples: [
@@ -382,7 +415,7 @@ export function needsCredentialSetup(
     needsRegionStep(provider) ||
     (modelIdOverride === null &&
       process.env[OPENWIKI_MODEL_ID_ENV_KEY] === undefined) ||
-    process.env.LANGSMITH_API_KEY === undefined;
+    process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] === undefined;
 
   if (needsCredentials) {
     return true;
@@ -1472,7 +1505,7 @@ export function InitSetup({
       setInput("");
       setIsCustomModelInput(false);
 
-      if (process.env.LANGSMITH_API_KEY === undefined) {
+      if (process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] === undefined) {
         setStep("langsmith");
         return;
       }
@@ -1583,7 +1616,11 @@ export function InitSetup({
       setSecretInputIndex(
         firstMissingSecretIndex === -1 ? 0 : firstMissingSecretIndex,
       );
-      setInput("");
+      setInput(
+        firstMissingSecretIndex === -1
+          ? ""
+          : getSourceInputDefault(source.secretInputs[firstMissingSecretIndex]),
+      );
       setCronModeSelectionIndex(0);
       setPowerModeSelectionIndex(0);
       setCronFieldSelectionIndex(0);
@@ -1607,16 +1644,23 @@ export function InitSetup({
         return;
       }
 
-      const trimmedInput = input.trim();
-      if (trimmedInput.length === 0 && !currentSecretInput.optional) {
+      let normalizedInput: string;
+      try {
+        normalizedInput = normalizeSourceInput(currentSecretInput, input);
+      } catch (inputError) {
+        setError(getErrorMessage(inputError));
+        return;
+      }
+
+      if (normalizedInput.length === 0 && !currentSecretInput.optional) {
         setError(`${currentSecretInput.envKey} is required.`);
         return;
       }
 
       const nextSecretValues = {
         ...sourceState.secretValues,
-        ...(trimmedInput.length > 0
-          ? { [currentSecretInput.envKey]: trimmedInput }
+        ...(normalizedInput.length > 0
+          ? { [currentSecretInput.envKey]: normalizedInput }
           : {}),
       };
       setSourceState((state) => ({
@@ -1635,6 +1679,9 @@ export function InitSetup({
 
       if (nextMissingIndex !== -1) {
         setSecretInputIndex(nextMissingIndex);
+        setInput(
+          getSourceInputDefault(selectedSource.secretInputs[nextMissingIndex]),
+        );
         return;
       }
 
@@ -1778,7 +1825,9 @@ export function InitSetup({
 
   async function saveSelectedSourceDescription(description: string) {
     const connectorConfig =
-      selectedSourceId === "web-search" || selectedSourceId === "hackernews"
+      selectedSourceId === "web-search" ||
+      selectedSourceId === "hackernews" ||
+      selectedSourceId === "langsmith"
         ? getStaticSourceConfig(selectedSourceId, description)
         : sourceState.connectorConfig;
 
@@ -1791,7 +1840,12 @@ export function InitSetup({
       connectorConfig,
       connectorId: selectedSourceId,
       id: sourceInstanceId,
-      ingestionGoal: description.length > 0 ? description : undefined,
+      ingestionGoal:
+        selectedSourceId === "langsmith"
+          ? "Extract durable user-authored memories and organize them for future agent retrieval."
+          : description.length > 0
+            ? description
+            : undefined,
       name: createSourceInstanceName(
         selectedSource,
         description,
@@ -1983,7 +2037,7 @@ export function InitSetup({
       }
 
       if (nextLangSmithKey !== null) {
-        updates.LANGSMITH_API_KEY = nextLangSmithKey;
+        updates[LANGSMITH_TRACING_API_KEY_ENV_KEY] = nextLangSmithKey;
 
         if (nextLangSmithKey.length > 0) {
           updates.LANGCHAIN_PROJECT = "openwiki";
@@ -2055,7 +2109,11 @@ export function InitSetup({
         setInput(getDefaultLocalGitRepoPath());
         setStep("source-path");
         return;
-      } else if (source.id === "web-search" || source.id === "hackernews") {
+      } else if (
+        source.id === "web-search" ||
+        source.id === "hackernews" ||
+        source.id === "langsmith"
+      ) {
         setSourceState((state) => ({
           ...state,
           connectorConfig: getStaticSourceConfig(source.id, ""),
@@ -2245,7 +2303,7 @@ export function InitSetup({
     needsRegionStep(provider) ||
     (modelIdOverride === null &&
       process.env[OPENWIKI_MODEL_ID_ENV_KEY] === undefined) ||
-    process.env.LANGSMITH_API_KEY === undefined;
+    process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] === undefined;
   const apiKeyEnvKey = getProviderApiKeyEnvKey(provider);
   const projectEnvKey = getProviderProjectEnvKey(provider);
   const locationEnvKey = getProviderLocationEnvKey(provider);
@@ -2378,16 +2436,16 @@ export function InitSetup({
           detail={getModelSetupDetail(modelIdOverride, provider)}
         />
         <SetupStep
-          label="LangSmith"
+          label="LangSmith tracing"
           state={
-            process.env.LANGSMITH_API_KEY !== undefined
+            process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] !== undefined
               ? "done"
               : step === "langsmith"
                 ? "current"
                 : "optional"
           }
           detail={
-            process.env.LANGSMITH_API_KEY !== undefined
+            process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] !== undefined
               ? "available from environment"
               : "optional tracing key"
           }
@@ -2789,11 +2847,16 @@ function Prompt({
   if (step === "langsmith") {
     return (
       <Box flexDirection="column">
-        <Text>Optional: paste a LangSmith API key for tracing.</Text>
+        <Text>
+          Optional: paste a LangSmith API key for tracing OpenWiki's own runs.
+        </Text>
+        <Text color="gray">
+          This is separate from the LangSmith ingestion connector key.
+        </Text>
         <BorderedInput
           maxDisplayWidth={inputDisplayWidth}
           marginTop={1}
-          prefix="LANGSMITH_API_KEY optional="
+          prefix={`${LANGSMITH_TRACING_API_KEY_ENV_KEY} optional=`}
           secret
           value={input}
         />
@@ -2978,19 +3041,19 @@ function Prompt({
         ))}
         {secretInput ? (
           <Box flexDirection="column" marginTop={1}>
-            <Text bold>Enter credential</Text>
+            <Text bold>{secretInput.label}</Text>
             <BorderedInput
               maxDisplayWidth={inputDisplayWidth}
-              prefix={`${secretInput.envKey}${
-                secretInput.optional ? " optional" : ""
-              }=`}
-              secret
+              prefix={`${secretInput.envKey}${secretInput.optional ? " optional" : ""}=`}
+              secret={secretInput.secret}
               value={input}
             />
             <Text color="gray">
-              {secretInput.optional
-                ? "Press Enter with an empty value to skip."
-                : "Press Enter to save this value."}
+              {secretInput.defaultValue
+                ? "Press Enter to use the default value."
+                : secretInput.optional
+                  ? "Press Enter with an empty value to skip."
+                  : "Press Enter to save this value."}
             </Text>
           </Box>
         ) : null}
@@ -3596,7 +3659,7 @@ export function getInitialStep(
     return "model";
   }
 
-  if (process.env.LANGSMITH_API_KEY === undefined) {
+  if (process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] === undefined) {
     return "langsmith";
   }
 
@@ -3737,7 +3800,7 @@ function getNextStepAfterRegion(
     return "model";
   }
 
-  if (process.env.LANGSMITH_API_KEY === undefined) {
+  if (process.env[LANGSMITH_TRACING_API_KEY_ENV_KEY] === undefined) {
     return "langsmith";
   }
 
@@ -3832,7 +3895,22 @@ function isCodeMode(config: OpenWikiOnboardingConfig): boolean {
 }
 
 function needsEnvValue(secretInput: SourceSecretInput): boolean {
-  return !process.env[secretInput.envKey];
+  const value = process.env[secretInput.envKey];
+
+  if (!value) {
+    return true;
+  }
+
+  if (secretInput.envKey !== OPENWIKI_LANGSMITH_ENDPOINT_ENV_KEY) {
+    return false;
+  }
+
+  try {
+    normalizeOpenWikiLangSmithEndpoint(value);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 function addSourceInstanceConfig(
@@ -4084,6 +4162,10 @@ function getSourceDescriptionPrompt(source: SourceSetupOption): string {
     return "Describe the topics, keywords, users, or story types OpenWiki should watch on Hacker News.";
   }
 
+  if (source.id === "langsmith") {
+    return "Enter the exact LangSmith project name or project UUID to ingest.";
+  }
+
   if (source.id === "git-repo") {
     return "Describe what OpenWiki should understand about this repository.";
   }
@@ -4296,9 +4378,10 @@ function normalizeLocalPath(value: string): string {
   return path.resolve(trimmedValue);
 }
 
-function getStaticSourceConfig(
+export function getStaticSourceConfig(
   sourceId: ConnectorId,
   query: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, unknown> {
   const queries = query.trim().length > 0 ? [query.trim()] : [];
 
@@ -4327,9 +4410,49 @@ function getStaticSourceConfig(
     };
   }
 
+  if (sourceId === "langsmith") {
+    const project = query.trim();
+    const apiUrl = resolveOpenWikiLangSmithEndpoint(env);
+    if (
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        project,
+      )
+    ) {
+      return {
+        apiUrl,
+        enabled: true,
+        projectId: project,
+      };
+    }
+
+    return {
+      apiUrl,
+      enabled: true,
+      projectName: project,
+    };
+  }
+
   return {
     enabled: true,
   };
+}
+
+function getSourceInputDefault(
+  sourceInput: SourceSecretInput | undefined,
+): string {
+  return sourceInput?.defaultValue ?? "";
+}
+
+function normalizeSourceInput(
+  sourceInput: SourceSecretInput,
+  value: string,
+): string {
+  const normalized = value.trim() || sourceInput.defaultValue || "";
+
+  return sourceInput.envKey === OPENWIKI_LANGSMITH_ENDPOINT_ENV_KEY &&
+    normalized
+    ? normalizeOpenWikiLangSmithEndpoint(normalized)
+    : normalized;
 }
 
 function getErrorMessage(error: unknown): string {

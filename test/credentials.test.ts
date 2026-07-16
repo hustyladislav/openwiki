@@ -1,10 +1,18 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { needsCredentialSetup } from "../src/credentials.tsx";
+import {
+  LANGSMITH_API_KEY_ENV_KEY,
+  LANGSMITH_TRACING_API_KEY_ENV_KEY,
+} from "../src/constants.ts";
+import {
+  getStaticSourceConfig,
+  needsCredentialSetup,
+} from "../src/credentials.tsx";
 
 const ENV_KEYS = [
   "LANGSMITH_API_KEY",
   "OPENROUTER_API_KEY",
   "OPENWIKI_MODEL_ID",
+  "OPENWIKI_LANGSMITH_ENDPOINT",
   "OPENWIKI_PROVIDER",
 ] as const;
 
@@ -32,5 +40,40 @@ describe("needsCredentialSetup", () => {
     process.env.LANGSMITH_API_KEY = "lsv2_placeholder";
 
     expect(needsCredentialSetup()).toBe(true);
+  });
+});
+
+describe("LangSmith source configuration", () => {
+  test("keeps connector ingestion separate from OpenWiki tracing", () => {
+    expect(LANGSMITH_API_KEY_ENV_KEY).toBe("OPENWIKI_LANGSMITH_API_KEY");
+    expect(LANGSMITH_TRACING_API_KEY_ENV_KEY).toBe("LANGSMITH_API_KEY");
+  });
+
+  test("uses the US endpoint by default", () => {
+    expect(getStaticSourceConfig("langsmith", "my-agent-project", {})).toEqual({
+      apiUrl: "https://api.smith.langchain.com",
+      enabled: true,
+      projectName: "my-agent-project",
+    });
+  });
+
+  test("persists the configured EU endpoint in the source config", () => {
+    expect(
+      getStaticSourceConfig("langsmith", "my-agent-project", {
+        OPENWIKI_LANGSMITH_ENDPOINT: "https://eu.api.smith.langchain.com",
+      }),
+    ).toEqual({
+      apiUrl: "https://eu.api.smith.langchain.com",
+      enabled: true,
+      projectName: "my-agent-project",
+    });
+  });
+
+  test("rejects endpoints outside the LangSmith US and EU allowlist", () => {
+    expect(() =>
+      getStaticSourceConfig("langsmith", "my-agent-project", {
+        OPENWIKI_LANGSMITH_ENDPOINT: "https://example.com",
+      }),
+    ).toThrow(/LangSmith endpoint must be/u);
   });
 });

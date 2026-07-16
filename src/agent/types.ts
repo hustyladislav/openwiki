@@ -1,3 +1,8 @@
+import type {
+  ConnectorSourceUpdate,
+  ConnectorSourceUpdateReceipt,
+} from "../connectors/types.js";
+
 export type OpenWikiCommand = "chat" | "init" | "update";
 export type OpenWikiOutputMode = "local-wiki" | "repository";
 
@@ -5,6 +10,8 @@ export type OpenWikiRunResult = {
   command: OpenWikiCommand;
   model: string;
   skipped?: boolean;
+  sourceUpdateReceipt?: ConnectorSourceUpdateReceipt;
+  wikiChanged?: boolean;
 };
 
 export type OpenWikiRunEvent =
@@ -33,10 +40,12 @@ export type OpenWikiRunEvent =
 
 export type OpenWikiRunOptions = {
   debug?: boolean;
+  disableShell?: boolean;
   isFollowup?: boolean;
   modelId?: string | null;
   onEvent?: (event: OpenWikiRunEvent) => void;
   outputMode?: OpenWikiOutputMode;
+  sourceUpdate?: ConnectorSourceUpdate;
   threadId?: string;
   userMessage?: string | null;
   telemetryFile?: string;

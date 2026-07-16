@@ -82,4 +82,61 @@ describe("OpenWikiLocalShellBackend", () => {
       readFile(path.join(rootDir, "notes.md"), "utf8"),
     ).resolves.toBe("ok");
   });
+
+  test("blocks every mutation and host shell command in read-only mode", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "openwiki-backend-"));
+    const backend = new OpenWikiLocalShellBackend({
+      docsOnly: false,
+      readOnly: true,
+      rootDir,
+      virtualMode: true,
+    });
+
+    const write = await backend.write("/notes.md", "blocked");
+    expect(write.error).toContain("read-only");
+    await expect(
+      backend.uploadFiles([["notes.md", new TextEncoder().encode("blocked")]]),
+    ).resolves.toEqual([{ error: "permission_denied", path: "notes.md" }]);
+    await expect(backend.execute("touch escaped.txt")).resolves.toEqual(
+      expect.objectContaining({ exitCode: 1 }),
+    );
+    await expect(
+      readFile(path.join(rootDir, "notes.md"), "utf8"),
+    ).rejects.toThrow();
+    await expect(
+      readFile(path.join(rootDir, "escaped.txt"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  test("keeps transient agent files out of the wiki when shell is disabled", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "openwiki-backend-"));
+    const backend = new OpenWikiLocalShellBackend({
+      docsOnly: true,
+      outputMode: "local-wiki",
+      rootDir,
+      shellDisabled: true,
+      virtualMode: true,
+    });
+
+    await expect(
+      backend.uploadFiles([
+        ["conversation_history/raw.json", new TextEncoder().encode("blocked")],
+        ["large_tool_results/raw.json", new TextEncoder().encode("blocked")],
+      ]),
+    ).resolves.toEqual([
+      {
+        error: "permission_denied",
+        path: "conversation_history/raw.json",
+      },
+      {
+        error: "permission_denied",
+        path: "large_tool_results/raw.json",
+      },
+    ]);
+    const write = await backend.write(
+      "/conversation_history/raw.json",
+      "blocked",
+    );
+    expect(write.error).toContain("ephemeral agent state");
+  });
 });

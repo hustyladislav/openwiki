@@ -41,7 +41,7 @@ OpenWiki has two modes:
 
 - **Personal mode** builds a local personal brain wiki in `~/.openwiki/wiki` from
   configured sources like local repositories, Gmail, Notion, Web Search, Hacker
-  News, and X/Twitter.
+  News, LangSmith, and X/Twitter.
 - **Code mode** builds repository documentation in `openwiki/` for the current
   codebase.
 
@@ -166,13 +166,13 @@ repository wiki: OpenWiki reads it for scope and priorities, but it is not
 generated documentation and is not rewritten during normal init, update, or chat
 runs unless you explicitly ask to change the brief.
 
-On the first interactive run, OpenWiki will have you configure your inference provider, API key, and LLM. You will also be able to set a LangSmith API key to trace your OpenWiki runs to a LangSmith tracing project named "openwiki" (optional).
+On the first interactive run, OpenWiki will have you configure your inference provider, API key, and LLM. You will also be able to set `LANGSMITH_API_KEY` to trace OpenWiki's own runs to a LangSmith tracing project named "openwiki" (optional). This tracing credential is separate from the read-only credential used by the LangSmith ingestion connector.
 
 These configuration options and secrets will be saved to `~/.openwiki/.env` on your local machine.
 
 ## Local Connectors
 
-OpenWiki's first-run onboarding offers connector setup for local Git repositories, Notion, Gmail, X/Twitter, Web Search, and Hacker News. During an ingestion run, deterministic connector tools write raw data and manifests under `~/.openwiki/connectors/<connector>/raw/`, then source-specific agent runs synthesize the local wiki under `~/.openwiki/wiki/` from those local files.
+OpenWiki's first-run onboarding offers connector setup for local Git repositories, Notion, Gmail, X/Twitter, Web Search, Hacker News, and LangSmith. During an ingestion run, deterministic connector tools write raw data and manifests under `~/.openwiki/connectors/<connector>/raw/`, then source-specific agent runs synthesize the local wiki under `~/.openwiki/wiki/` from those local files.
 
 You can configure the same connector more than once. For example, add one Web
 Search source for AI research and another for NBA news; OpenWiki stores them as
@@ -187,6 +187,43 @@ instances with `openwiki ingest all`, all instances for one connector with
 - `google` uses the Gmail API directly with OAuth user credentials to fetch recent mail, with room to add Drive, Calendar, and other Google providers later.
 - `web-search` uses Tavily through LangChain and requires `TAVILY_API_KEY`.
 - `hackernews` uses public Hacker News feed and search APIs, with no credentials required.
+- `langsmith` uses the official LangSmith SDK and the connector-specific `OPENWIKI_LANGSMITH_API_KEY`. It exhaustively paginates bounded root-run time segments, writes compact user/assistant evidence with trace provenance, revisits pending roots, and advances each per-source cursor only after wiki synthesis succeeds. Unchanged runs in the overlap window are skipped by content hash. Set `OPENWIKI_LANGSMITH_ENDPOINT` to `https://api.smith.langchain.com` (the default) or `https://eu.api.smith.langchain.com`; onboarding validates the value and saves it as `apiUrl` in each LangSmith source config.
+
+For a non-interactive LangSmith setup, store the connector credential and
+endpoint in `~/.openwiki/.env`:
+
+```dotenv
+OPENWIKI_LANGSMITH_API_KEY=<read-only-personal-access-token>
+OPENWIKI_LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+```
+
+Then configure one project by name or UUID, using the same allowlisted endpoint:
+
+```json
+{
+  "apiUrl": "https://eu.api.smith.langchain.com",
+  "batchHours": 168,
+  "enabled": true,
+  "includeCwdPrefixes": ["/Users/me/"],
+  "overlapHours": 24,
+  "projectName": "my-agent-project",
+  "startTime": "2026-01-01T00:00:00.000Z"
+}
+```
+
+Save that JSON as `~/.openwiki/connectors/langsmith/config.json`, then run
+`openwiki ingest langsmith`. `startTime` is the first historical backfill
+boundary; `batchHours` bounds each exhaustive segment without imposing an item
+cap, and later runs resume from the acknowledged per-source checkpoint with the
+configured overlap. `includeCwdPrefixes` is an optional positive scope filter;
+runs without a matching `cwd` are excluded. Omit `startTime` to use the normal
+ingestion window. The LangSmith connector is direct-API and does not use
+`openwiki auth`.
+
+`LANGSMITH_API_KEY` remains reserved for optional tracing of OpenWiki itself.
+It is never used as the ingestion connector credential; configure
+`OPENWIKI_LANGSMITH_API_KEY` separately so connector read access and OpenWiki
+tracing can be managed independently.
 
 Connector secrets are referenced by env var name and stored in `~/.openwiki/.env`; connector config files should never contain raw secret values.
 
@@ -281,8 +318,9 @@ The wizard opens `https://auth.openai.com` in your browser (and also prints the
 URL for headless/SSH use, where you can open it on another machine — or paste the
 redirect URL back into the terminal to finish without a callback). After you sign
 in with your ChatGPT account, OpenWiki captures the OAuth callback, shows the
-signed-in email and plan, and then continues to model and LangSmith selection
-just like the other providers. It stores the resulting access token, refresh
+signed-in email and plan, and then continues to model selection and the optional
+LangSmith tracing prompt just like the other providers. It stores the resulting
+access token, refresh
 token, expiry, account id, email, and plan in `~/.openwiki/.env`
 (`OPENAI_CHATGPT_ACCESS_TOKEN`, `OPENAI_CHATGPT_REFRESH_TOKEN`,
 `OPENAI_CHATGPT_EXPIRES_AT`, `OPENAI_CHATGPT_ACCOUNT_ID`, `OPENAI_CHATGPT_EMAIL`,

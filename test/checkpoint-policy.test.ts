@@ -9,6 +9,13 @@ describe("checkpoint persistence policy", () => {
     expect(target.connString).toMatch(/openwiki\.sqlite$/u);
   });
 
+  test("uses an in-memory checkpoint for read-only chat queries", () => {
+    expect(resolveCheckpointTarget("chat", true)).toEqual({
+      connString: ":memory:",
+      persistent: false,
+    });
+  });
+
   test.each(["init", "update"] as const)(
     "uses an in-memory checkpoint database for %s runs",
     (command) => {

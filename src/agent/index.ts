@@ -13,6 +13,7 @@ import {
   CompositeBackend,
   createDeepAgent,
   FilesystemBackend,
+  StateBackend,
 } from "deepagents";
 import { createOpenWikiConnectorTools } from "../connectors/tools.js";
 import {
@@ -110,7 +111,10 @@ export async function runOpenWikiAgent(
   emitDebug(options, `env.beforeLoad ${formatEnvironmentDebug()}`);
 
   await loadOpenWikiEnv();
-  await syncBundledSkills();
+  const readOnly = process.env.OPENWIKI_READ_ONLY === "1";
+  if (!readOnly) {
+    await syncBundledSkills();
+  }
   emitDebug(options, "env=loaded ~/.openwiki/.env");
   emitDebug(options, `env.afterLoad ${formatEnvironmentDebug()}`);
 
@@ -210,6 +214,11 @@ async function runOpenWikiAgentCore(
   modelId: string,
   providerRetryAttempts: number,
 ): Promise<OpenWikiRunResult> {
+  const readOnly = process.env.OPENWIKI_READ_ONLY === "1";
+  const shellDisabled =
+    readOnly ||
+    options.disableShell === true ||
+    process.env.OPENWIKI_DISABLE_SHELL === "1";
   const outputMode = options.outputMode ?? "local-wiki";
   const context = await createRunContext(command, cwd, outputMode);
   emitDebug(options, "context=created");
@@ -223,7 +232,7 @@ async function runOpenWikiAgentCore(
   emitDebug(options, "model=initialized");
   const threadId = options.threadId ?? createThreadId(cwd, createRunThreadId());
   emitDebug(options, `thread=${threadId}`);
-  const checkpointTarget = resolveCheckpointTarget(command);
+  const checkpointTarget = resolveCheckpointTarget(command, readOnly);
   const checkpointer = await createCheckpointer(checkpointTarget);
   emitDebug(
     options,
@@ -233,6 +242,8 @@ async function runOpenWikiAgentCore(
   );
   const wikiBackend = new OpenWikiLocalShellBackend({
     docsOnly: command !== "chat",
+    readOnly,
+    shellDisabled,
     maxOutputBytes: 100_000,
     outputMode,
     rootDir: cwd,
@@ -240,14 +251,24 @@ async function runOpenWikiAgentCore(
     virtualMode: true,
   });
   const backend = new CompositeBackend(wikiBackend, {
+    "/conversation_history/": new StateBackend(),
+    "/large_tool_results/": new StateBackend(),
     "/skills/": new FilesystemBackend({
       rootDir: openWikiSkillsDir,
       virtualMode: true,
     }),
   });
+  let sourceUpdateReceipt: OpenWikiRunResult["sourceUpdateReceipt"];
   const agent = createDeepAgent({
     model,
-    tools: createOpenWikiConnectorTools(),
+    tools: readOnly
+      ? []
+      : createOpenWikiConnectorTools({
+          onSourceUpdateReceipt: (receipt) => {
+            sourceUpdateReceipt = receipt;
+          },
+          sourceUpdate: options.sourceUpdate,
+        }),
     checkpointer,
     backend,
     middleware:
@@ -276,12 +297,15 @@ async function runOpenWikiAgentCore(
     configurable: {
       thread_id: threadId,
     },
+    metadata: {
+      openwiki: true,
+    },
+    tags: ["openwiki"],
     version: "v3",
   });
   emitDebug(options, "stream=started protocol=events version=v3");
 
   let unhandledChunkCount = 0;
-
   try {
     for await (const chunk of stream) {
       const event = parseStreamEvent(chunk);
@@ -350,6 +374,8 @@ async function runOpenWikiAgentCore(
   return {
     command,
     model: modelId,
+    sourceUpdateReceipt,
+    wikiChanged: metadataWritten,
   };
 }
 
@@ -384,7 +410,7 @@ ${cwd}
 Runtime note:
 - ${formatRuntimeRootInstruction(options.outputMode ?? "local-wiki")}
 - Do not pass host absolute paths to filesystem tools. A host absolute path will be treated as a virtual path and will write to the wrong location.
-- Shell execute commands run on the host. For execute, use cd ${cwd} before commands that should run against this root.
+- ${options.disableShell === true ? "Shell execution is disabled for this run." : `Shell execute commands run on the host. For execute, use cd ${cwd} before commands that should run against this root.`}
 - Do not search parent directories or unrelated directories.
 `.trim();
 }
@@ -422,8 +448,9 @@ async function prepareCheckpointDirectory(filePath: string): Promise<void> {
 
 export function resolveCheckpointTarget(
   command: OpenWikiCommand,
+  readOnly = false,
 ): CheckpointTarget {
-  if (command === "chat") {
+  if (command === "chat" && !readOnly) {
     return {
       connString: checkpointPath,
       persistent: true,
@@ -457,9 +484,7 @@ function createThreadId(cwd: string, runId: string): string {
 }
 
 function createRunThreadId(): string {
-  return `${Date.now().toString(36)}-${Math.random()
-    .toString(36)
-    .slice(2, 10)}`;
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function emitDebug(options: OpenWikiRunOptions, message: string): void {
